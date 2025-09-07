@@ -409,7 +409,7 @@ int main(int argc, char** argv) {
     glfwSetCursorPosCallback(win, cursorCB);
     glfwSetInputMode(win, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
-    const float seaY = 0.0f, landY = seaY + 0.10f;
+    const float seaY = 0.0f, landY = 0.0f;
     const float worldR = 6.5f;
 
     // 读取文件或使用默认生成
