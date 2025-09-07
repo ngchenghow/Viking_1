@@ -1,4 +1,4 @@
-﻿// main.cpp — Island + Plateaus (polygon coords) + Near-Shore Foam (poly SDF)
+﻿// main.cpp — Island (polygon coast) + Near-Shore Foam (poly SDF) + F3 Grid (No Plateaus)
 // 固化白带可见性：用 SDF 在地面上着色白带（-uLandRimWidth <= s <= 0）
 //
 // Deps (vcpkg): glfw3 glad glm
@@ -7,7 +7,7 @@
 //   cl /EHsc /std:c++20 /W4 main.cpp ^
 //      /I"%VCPKG_ROOT%\\installed\\x64-windows\\include" ^
 //      /D_CRT_SECURE_NO_WARNINGS /MD ^
-//      /Fe:island_plateau_poly_foam.exe ^
+//      /Fe:island_poly_foam_grid.exe ^
 //      /link /LIBPATH:"%VCPKG_ROOT%\\installed\\x64-windows\\lib" glfw3.lib glad.lib opengl32.lib
 
 #include <cstdio>
@@ -171,7 +171,12 @@ in vec3 vPosW; in vec3 vNrmW; in float vKind;
 uniform vec3 uCam, uLightDir, uHorizon, uSky; uniform float uFogNear, uFogFar, uTime;
 const int MAX_COAST=512; uniform int uCoastCount; uniform vec2 uCoast[MAX_COAST];
 uniform float uFoamWidth, uFoamFreq, uWaveSpeed, uFoamDuty;
-uniform float uLandRimWidth; // 新增：地面白带宽度（世界坐标）
+uniform float uLandRimWidth; // 地面白带宽度
+// Grid uniforms
+uniform int   uGridOn;        // 1=显示，0=隐藏
+uniform float uGridCell;      // 小格尺寸（世界坐标）
+uniform int   uGridBoldN;     // 每N格加粗
+uniform float uGridMix;       // 网格混合强度 [0..1]
 out vec4 FragColor;
 
 vec3 landColor(){return vec3(0.80,0.82,0.66);}
@@ -209,7 +214,7 @@ void main(){
     vec3 N=normalize(vNrmW), L=normalize(-uLightDir); float diff=max(dot(N,L),0.0);
     vec3 col=base*(0.85 + (vKind>1.5?0.12:0.08)*diff);
 
-    // ---- 海面泡沫（保持）----
+    // ---- 海面泡沫 ----
     if(vKind>1.5 && vKind<2.5){
         vec2 xz=vPosW.xz; float s=coastSDF(xz); float nearMask=step(0.0,s)*step(s,uFoamWidth);
         float jitter=2.1*fbm1_4(dot(xz,vec2(0.21,-0.17)) + 0.12*uTime);
@@ -220,14 +225,34 @@ void main(){
         col=mix(col, vec3(0.97), foam);
     }
 
-    // ---- 地面白带（新增，稳定可见）----
+    // ---- 地面白带（稳定可见）----
     if(vKind<0.5){
         float s = coastSDF(vPosW.xz); // 岛内为负
         float w = max(uLandRimWidth, 1e-4);
         float mask = step(-w, s) * step(s, 0.0); // -w <= s <= 0
-        // 轻微柔化边缘
         float soft = smoothstep(-w, -0.7*w, s) * (1.0 - smoothstep(-0.3*w, 0.0, s));
         col = mix(col, rimColor(), max(mask, soft*0.85));
+    }
+
+    // ---- 地图网格（F3 开关；仅地面/顶/水面）----
+    if(uGridOn==1 && vKind<2.5){
+        float cell = max(uGridCell, 1e-4);
+        vec2 q = vPosW.xz / cell;
+        vec2 fw = fwidth(q);
+        vec2 a = abs(fract(q - 0.5) - 0.5) / max(fw, vec2(1e-5));
+        float minorLine = 1.0 - clamp(min(a.x, a.y), 0.0, 1.0);
+
+        float boldLine = 0.0;
+        if(uGridBoldN > 1){
+            float cM = cell * float(uGridBoldN);
+            vec2 qM = vPosW.xz / cM;
+            vec2 fwM = fwidth(qM);
+            vec2 b = abs(fract(qM - 0.5) - 0.5) / max(fwM, vec2(1e-5));
+            boldLine = 1.0 - clamp(min(b.x, b.y), 0.0, 1.0);
+        }
+        float gline = max(minorLine, boldLine);
+        vec3 gridCol = vec3(0.08); // 深灰网格线
+        col = mix(col, gridCol, clamp(uGridMix * gline, 0.0, 1.0));
     }
 
     float dist=length(uCam - vPosW), f=clamp((dist-uFogNear)/(uFogFar-uFogNear),0.0,1.0);
@@ -258,13 +283,14 @@ struct Cam {
     glm::mat4 view()const { return glm::lookAt(pos, pos + fwd(), { 0,1,0 }); }
 };
 static Cam gCam;
-static bool gKeys[512]{}, gWire = false, gCap = true, gCull = true;
+static bool gKeys[512]{}, gWire = false, gCap = true, gCull = true, gGrid = false;
 
 static void keyCB(GLFWwindow* w, int k, int, int a, int) {
     if (k >= 0 && k < 512) { if (a == GLFW_PRESS) gKeys[k] = true; else if (a == GLFW_RELEASE) gKeys[k] = false; }
     if (k == GLFW_KEY_ESCAPE && a == GLFW_PRESS) glfwSetWindowShouldClose(w, 1);
     if (k == GLFW_KEY_F1 && a == GLFW_PRESS) gWire = !gWire;
     if (k == GLFW_KEY_F2 && a == GLFW_PRESS) gCull = !gCull;
+    if (k == GLFW_KEY_F3 && a == GLFW_PRESS) gGrid = !gGrid;             // F3: 网格开关
     if (k == GLFW_KEY_TAB && a == GLFW_PRESS) { gCap = !gCap; glfwSetInputMode(w, GLFW_CURSOR, gCap ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL); }
 }
 static void cursorCB(GLFWwindow* w, double x, double y) {
@@ -283,13 +309,8 @@ static std::vector<glm::vec2> makeCoastPoly(int N, float R, float) {
         P.push_back({ r * std::cos(a), r * std::sin(a) });
     } if (!isCCW(P)) std::reverse(P.begin(), P.end()); return P;
 }
-static std::vector<glm::vec2> makeCirclePoly(glm::vec2 c, float r, int N) {
-    std::vector<glm::vec2> P; P.reserve(N);
-    for (int k = 0; k < N; k++) { float a = (float)k / N * glm::two_pi<float>(); P.push_back(c + glm::vec2(r * std::cos(a), r * std::sin(a))); }
-    if (!isCCW(P)) std::reverse(P.begin(), P.end()); return P;
-}
 
-// 顶面
+// 顶面（未使用但保留以便扩展）
 static void addTopFromPoly(Mesh& m, const std::vector<glm::vec2>& P, float y, float noiseAmp, float seed, float kind) {
     size_t baseV = m.v.size();
     for (auto& q : P) {
@@ -301,23 +322,6 @@ static void addTopFromPoly(Mesh& m, const std::vector<glm::vec2>& P, float y, fl
     for (size_t t = 0; t < tris.size(); t += 3)
         addTriI(m, (uint32_t)baseV + tris[t + 2], (uint32_t)baseV + tris[t + 1], (uint32_t)baseV + tris[t + 0]); // 反序→朝上
     accumulateAndNormalizeTopNormals(m, baseV, baseI);
-}
-
-// 侧壁（外侧为正面）
-static void addCliffFromPoly(Mesh& m, const std::vector<glm::vec2>& P, float yTop, float yBot) {
-    size_t n = P.size();
-    for (size_t i = 0; i < n; i++) {
-        glm::vec2 a2 = P[i], b2 = P[(i + 1) % n];
-        glm::vec3 A(a2.x, yTop, a2.y), B(b2.x, yTop, b2.y), C(a2.x, yBot, a2.y), D(b2.x, yBot, b2.y);
-        uint32_t ia = (uint32_t)m.v.size(); m.v.push_back(Vtx{ A,glm::vec3(0),4,0 });
-        uint32_t ib = (uint32_t)m.v.size(); m.v.push_back(Vtx{ B,glm::vec3(0),4,0 });
-        uint32_t ic = (uint32_t)m.v.size(); m.v.push_back(Vtx{ C,glm::vec3(0),4,0 });
-        uint32_t id = (uint32_t)m.v.size(); m.v.push_back(Vtx{ D,glm::vec3(0),4,0 });
-        addTriI(m, ia, ib, ic);
-        addTriI(m, ib, id, ic);
-        glm::vec2 e = b2 - a2; glm::vec2 nor2 = glm::normalize(glm::vec2(-e.y, e.x)); glm::vec3 N(nor2.x, 0, nor2.y);
-        m.v[ia].nrm = m.v[ic].nrm = m.v[ib].nrm = m.v[id].nrm = N;
-    }
 }
 
 // （可留可删）海岸白带几何——保留不影响 SDF 白带
@@ -346,8 +350,8 @@ static void addWater(Mesh& m, float seaY) {
     addTriI(m, i1, i2, i3);
 }
 
-// 构建场景
-static Mesh buildSceneByPolys(const std::vector<glm::vec2>& coast, const std::vector<std::vector<glm::vec2>>& plateaus, float seaY, float landY, float seed) {
+// 构建场景（无高原）
+static Mesh buildSceneByPolys(const std::vector<glm::vec2>& coast, float seaY, float landY, float seed) {
     Mesh m;
     // 地面
     {
@@ -361,18 +365,7 @@ static Mesh buildSceneByPolys(const std::vector<glm::vec2>& coast, const std::ve
         for (size_t t = 0; t < tris.size(); t += 3) addTriI(m, (uint32_t)bV + tris[t + 2], (uint32_t)bV + tris[t + 1], (uint32_t)bV + tris[t + 0]);
         accumulateAndNormalizeTopNormals(m, bV, bI);
     }
-    // 高原
-    for (size_t k = 0; k < plateaus.size(); ++k) {
-        float yTop = landY + (k == 0 ? 0.70f : k == 1 ? 0.58f : 0.48f);
-        size_t bV = m.v.size();
-        for (auto& q : plateaus[k]) { glm::vec3 pos(q.x, yTop, q.y); m.v.push_back(Vtx{ pos,glm::vec3(0),1,0 }); }
-        std::vector<uint32_t> tris; earClipTriangulate(plateaus[k], tris);
-        size_t bI = m.i.size();
-        for (size_t t = 0; t < tris.size(); t += 3) addTriI(m, (uint32_t)bV + tris[t + 2], (uint32_t)bV + tris[t + 1], (uint32_t)bV + tris[t + 0]);
-        accumulateAndNormalizeTopNormals(m, bV, bI);
-        addCliffFromPoly(m, plateaus[k], yTop, landY);
-    }
-    // （可选）几何白带 + 水面
+    // 几何白带 + 水面
     addRimFromCoast(m, coast, landY + 0.06f, 0.12f);
     addWater(m, seaY);
 
@@ -385,7 +378,7 @@ int main() {
 #if _DEBUG
     glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, GL_TRUE);
 #endif
-    GLFWwindow* win = glfwCreateWindow(1280, 720, "Island (Polygon) + Plateaus + Foam SDF — SDF rim", nullptr, nullptr);
+    GLFWwindow* win = glfwCreateWindow(1280, 720, "Island (Polygon) + Foam SDF — No Plateaus", nullptr, nullptr);
     Check(win != nullptr, "create window"); glfwMakeContextCurrent(win); glfwSwapInterval(1);
     Check(gladLoadGLLoader((GLADloadproc)glfwGetProcAddress) != 0, "glad"); EnableGLDebugIfAvailable();
 
@@ -398,12 +391,7 @@ int main() {
     const float worldR = 6.5f;
 
     std::vector<glm::vec2> coast = makeCoastPoly(180, worldR, 1337.0f);
-    std::vector<std::vector<glm::vec2>> plateaus{
-        makeCirclePoly({-2.0f, 0.8f}, 2.2f, 96),
-        makeCirclePoly({ 2.6f,-1.5f}, 1.7f, 84),
-        makeCirclePoly({ 0.2f, 0.2f}, 1.2f, 72),
-    };
-    Mesh scene = buildSceneByPolys(coast, plateaus, seaY, landY, 1337.0f);
+    Mesh scene = buildSceneByPolys(coast, seaY, landY, 1337.0f);
 
     GLuint prog = mkProgram(VS, FS);
     GLint uMVP = glGetUniformLocation(prog, "uMVP"), uModel = glGetUniformLocation(prog, "uModel"), uNrm = glGetUniformLocation(prog, "uNrmMat");
@@ -414,7 +402,12 @@ int main() {
     GLint uCoastCount = glGetUniformLocation(prog, "uCoastCount"), uCoastLoc = glGetUniformLocation(prog, "uCoast");
     GLint uFWidth = glGetUniformLocation(prog, "uFoamWidth"), uFFreq = glGetUniformLocation(prog, "uFoamFreq");
     GLint uWSpeed = glGetUniformLocation(prog, "uWaveSpeed"), uFDuty = glGetUniformLocation(prog, "uFoamDuty");
-    GLint uRimW = glGetUniformLocation(prog, "uLandRimWidth"); // 新增
+    GLint uRimW = glGetUniformLocation(prog, "uLandRimWidth");
+    // Grid uniforms
+    GLint uGridOn = glGetUniformLocation(prog, "uGridOn");
+    GLint uGridCell = glGetUniformLocation(prog, "uGridCell");
+    GLint uGridBoldN = glGetUniformLocation(prog, "uGridBoldN");
+    GLint uGridMix = glGetUniformLocation(prog, "uGridMix");
 
     glEnable(GL_DEPTH_TEST);
     glFrontFace(GL_CCW);
@@ -462,12 +455,18 @@ int main() {
         glUniform3f(uHor, 0.76f, 0.84f, 0.90f); glUniform3f(uSky, 0.80f, 0.86f, 0.92f);
         glUniform1f(uNear, 7.0f); glUniform1f(uFar, 40.0f); glUniform1f(uTime, tt);
 
-        // 参数
+        // 泡沫/白带参数
         glUniform1f(uFWidth, 0.38f);
         glUniform1f(uFFreq, 2.0f);
         glUniform1f(uWSpeed, +0.5f);
         glUniform1f(uFDuty, 0.22f);
-        glUniform1f(uRimW, 0.22f); // 地面白带宽度（可调）
+        glUniform1f(uRimW, 0.22f);
+
+        // 网格参数（F3）
+        glUniform1i(uGridOn, gGrid ? 1 : 0);
+        glUniform1f(uGridCell, 0.50f);  // 小格 0.5m
+        glUniform1i(uGridBoldN, 5);     // 每 5 格加粗
+        glUniform1f(uGridMix, 0.55f);   // 线条权重
 
         glBindVertexArray(scene.vao);
         glDrawElements(GL_TRIANGLES, (GLsizei)scene.i.size(), GL_UNSIGNED_INT, 0);
