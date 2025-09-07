@@ -361,20 +361,6 @@ static void addTopFromPoly(Mesh& m, const std::vector<glm::vec2>& P, float y, fl
     accumulateAndNormalizeTopNormals(m, baseV, baseI);
 }
 
-// （可留可删）海岸白带几何——保留不影响 SDF 白带
-static void addRimFromCoast(Mesh& m, const std::vector<glm::vec2>& coast, float y, float d) {
-    auto inner = coast, outer = offsetMiter(coast, d, 4.0f); size_t n = inner.size();
-    std::vector<uint32_t> inID(n), outID(n); glm::vec3 N(0, 1, 0);
-    for (size_t i = 0; i < n; i++) {
-        inID[i] = (uint32_t)m.v.size(); m.v.push_back(Vtx{ {inner[i].x,y,inner[i].y}, N,3,0 });
-        outID[i] = (uint32_t)m.v.size(); m.v.push_back(Vtx{ {outer[i].x,y,outer[i].y}, N,3,0 });
-    }
-    for (size_t i = 0; i < n; i++) {
-        size_t j = (i + 1) % n;
-        addTriI(m, inID[i], inID[j], outID[i]);
-        addTriI(m, inID[j], outID[j], outID[i]);
-    }
-}
 
 // 水面——CCW 朝上
 static void addWater(Mesh& m, float seaY) {
@@ -402,8 +388,7 @@ static Mesh buildSceneByPolys(const std::vector<glm::vec2>& coast, float seaY, f
         for (size_t t = 0; t < tris.size(); t += 3) addTriI(m, (uint32_t)bV + tris[t + 2], (uint32_t)bV + tris[t + 1], (uint32_t)bV + tris[t + 0]);
         accumulateAndNormalizeTopNormals(m, bV, bI);
     }
-    // 几何白带 + 水面
-    addRimFromCoast(m, coast, landY + 0.06f, 0.12f);
+    // 水面
     addWater(m, seaY);
 
     m.upload(); return m;
