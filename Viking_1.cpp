@@ -1,6 +1,7 @@
-﻿// main.cpp — Island (polygon coast) + Near-Shore Foam (poly SDF) + F3 Grid (No Plateaus)
-// 固化白带可见性：用 SDF 在地面上着色白带（-uLandRimWidth <= s <= 0）
-//
+﻿// main.cpp — Island (polygon coast from file) + Near-Shore Foam (poly SDF) + F3 Grid (No Plateaus)
+// 读取 coast.txt（或命令行参数的路径）中的2D坐标(x,y)作为海岸多边形（逆时针CCW）。
+// 每行可写多对坐标：  x y   或   x,y   （允许空格/逗号/Tab混排；支持 # 与 // 注释）
+// 运行：WASD/空格/左Ctrl移动，鼠标视角，TAB 捕获/释放，F1 线框，F2 背面剔除，F3 网格，F5 重新读取文本并重建。
 // Deps (vcpkg): glfw3 glad glm
 // Build (MSVC x64):
 //   vcpkg install glfw3 glad glm
@@ -18,12 +19,15 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <fstream>
+#include <sstream>
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
 #define GLM_FORCE_RADIANS
 #include <glm/glm.hpp>
+#include <glm/gtc/constants.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
@@ -125,6 +129,9 @@ static bool pointInPoly_stable(const glm::vec2& p, const std::vector<glm::vec2>&
     return c;
 }
 
+// 自定义平方长度（替代 glm::length2）
+static inline float len2(const glm::vec2& v) { return glm::dot(v, v); }
+
 // 外法线（CCW）：(-e.y, e.x)
 static std::vector<glm::vec2> offsetMiter(const std::vector<glm::vec2>& P, float d, float miterLimit = 4.0f) {
     size_t n = P.size(); std::vector<glm::vec2> Q(n);
@@ -152,6 +159,35 @@ static void accumulateAndNormalizeTopNormals(Mesh& m, size_t baseV, size_t baseI
         glm::vec3 n = m.v[vi].nrm; if (glm::dot(n, n) < 1e-10f) n = { 0,1,0 }; m.v[vi].nrm = glm::normalize(n);
     }
 }
+
+// --- 读文件 & 预处理 ---
+static void trimComment(std::string& s) {
+    auto cut = s.find('#'); if (cut != std::string::npos) s.resize(cut);
+    cut = s.find("//"); if (cut != std::string::npos) s.resize(cut);
+}
+static bool loadCoastFromFile(const char* path, std::vector<glm::vec2>& out) {
+    out.clear(); std::ifstream fin(path);
+    if (!fin) return false;
+    std::string line;
+    while (std::getline(fin, line)) {
+        trimComment(line);
+        for (char& c : line) if (c == ',' || c == '\t' || c == ';') c = ' ';
+        std::stringstream ss(line);
+        float x, y;
+        while (ss >> x >> y) out.emplace_back(x, y);
+    }
+    // 去重相邻过近点（使用 len2）
+    std::vector<glm::vec2> clean;
+    const float eps2 = 1e-6f;
+    for (size_t i = 0; i < out.size(); ++i) {
+        if (clean.empty() || len2(out[i] - clean.back()) > eps2) clean.push_back(out[i]);
+    }
+    // 头尾重复去除
+    if (clean.size() >= 2 && len2(clean.front() - clean.back()) <= eps2) clean.pop_back();
+    out.swap(clean);
+    return out.size() >= 3;
+}
+static void ensureCCW(std::vector<glm::vec2>& P) { if (!isCCW(P)) std::reverse(P.begin(), P.end()); }
 
 // --- shaders ---
 static const char* VS = R"GLSL(
@@ -231,7 +267,7 @@ void main(){
         float w = max(uLandRimWidth, 1e-4);
         float mask = step(-w, s) * step(s, 0.0); // -w <= s <= 0
         float soft = smoothstep(-w, -0.7*w, s) * (1.0 - smoothstep(-0.3*w, 0.0, s));
-        col = mix(col, rimColor(), max(mask, soft*0.85));
+        col = mix(col, vec3(0.97,0.97,0.99), max(mask, soft*0.85));
     }
 
     // ---- 地图网格（F3 开关；仅地面/顶/水面）----
@@ -251,7 +287,7 @@ void main(){
             boldLine = 1.0 - clamp(min(b.x, b.y), 0.0, 1.0);
         }
         float gline = max(minorLine, boldLine);
-        vec3 gridCol = vec3(0.08); // 深灰网格线
+        vec3 gridCol = vec3(0.08);
         col = mix(col, gridCol, clamp(uGridMix * gline, 0.0, 1.0));
     }
 
@@ -283,7 +319,7 @@ struct Cam {
     glm::mat4 view()const { return glm::lookAt(pos, pos + fwd(), { 0,1,0 }); }
 };
 static Cam gCam;
-static bool gKeys[512]{}, gWire = false, gCap = true, gCull = true, gGrid = false;
+static bool gKeys[512]{}, gWire = false, gCap = true, gCull = true, gGrid = false, gReload = false;
 
 static void keyCB(GLFWwindow* w, int k, int, int a, int) {
     if (k >= 0 && k < 512) { if (a == GLFW_PRESS) gKeys[k] = true; else if (a == GLFW_RELEASE) gKeys[k] = false; }
@@ -291,6 +327,7 @@ static void keyCB(GLFWwindow* w, int k, int, int a, int) {
     if (k == GLFW_KEY_F1 && a == GLFW_PRESS) gWire = !gWire;
     if (k == GLFW_KEY_F2 && a == GLFW_PRESS) gCull = !gCull;
     if (k == GLFW_KEY_F3 && a == GLFW_PRESS) gGrid = !gGrid;             // F3: 网格开关
+    if (k == GLFW_KEY_F5 && a == GLFW_PRESS) gReload = true;             // F5: 重新读取 coast.txt
     if (k == GLFW_KEY_TAB && a == GLFW_PRESS) { gCap = !gCap; glfwSetInputMode(w, GLFW_CURSOR, gCap ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL); }
 }
 static void cursorCB(GLFWwindow* w, double x, double y) {
@@ -300,7 +337,7 @@ static void cursorCB(GLFWwindow* w, double x, double y) {
     gCam.yaw += (float)dx * gCam.sens; gCam.pitch += (float)dy * gCam.sens; gCam.pitch = glm::clamp(gCam.pitch, -89.f, 89.f);
 }
 
-// --- shapes (coords) ---
+// --- shapes (fallback generator) ---
 static std::vector<glm::vec2> makeCoastPoly(int N, float R, float) {
     std::vector<glm::vec2> P; P.reserve(N);
     for (int k = 0; k < N; k++) {
@@ -334,7 +371,7 @@ static void addRimFromCoast(Mesh& m, const std::vector<glm::vec2>& coast, float 
     }
     for (size_t i = 0; i < n; i++) {
         size_t j = (i + 1) % n;
-        addTriI(m, inID[i], inID[j], outID[i]);  // 自上看大多为 CCW
+        addTriI(m, inID[i], inID[j], outID[i]);
         addTriI(m, inID[j], outID[j], outID[i]);
     }
 }
@@ -372,13 +409,13 @@ static Mesh buildSceneByPolys(const std::vector<glm::vec2>& coast, float seaY, f
     m.upload(); return m;
 }
 
-int main() {
+int main(int argc, char** argv) {
     Check(glfwInit() != 0, "glfwInit");
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3); glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3); glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 #if _DEBUG
     glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, GL_TRUE);
 #endif
-    GLFWwindow* win = glfwCreateWindow(1280, 720, "Island (Polygon) + Foam SDF — No Plateaus", nullptr, nullptr);
+    GLFWwindow* win = glfwCreateWindow(1280, 720, "Island (Polygon from File) + Foam SDF — No Plateaus", nullptr, nullptr);
     Check(win != nullptr, "create window"); glfwMakeContextCurrent(win); glfwSwapInterval(1);
     Check(gladLoadGLLoader((GLADloadproc)glfwGetProcAddress) != 0, "glad"); EnableGLDebugIfAvailable();
 
@@ -390,7 +427,18 @@ int main() {
     const float seaY = 0.0f, landY = seaY + 0.10f;
     const float worldR = 6.5f;
 
-    std::vector<glm::vec2> coast = makeCoastPoly(180, worldR, 1337.0f);
+    // 读取文件或使用默认生成
+    std::string coastPath = (argc > 1 ? argv[1] : "coast.txt");
+    std::vector<glm::vec2> coast;
+    if (loadCoastFromFile(coastPath.c_str(), coast)) {
+        ensureCCW(coast);
+        std::fprintf(stderr, "[info] loaded %zu points from %s\n", coast.size(), coastPath.c_str());
+    }
+    else {
+        std::fprintf(stderr, "[warn] cannot open %s, use fallback generated polygon.\n", coastPath.c_str());
+        coast = makeCoastPoly(180, worldR, 1337.0f);
+    }
+
     Mesh scene = buildSceneByPolys(coast, seaY, landY, 1337.0f);
 
     GLuint prog = mkProgram(VS, FS);
@@ -413,14 +461,27 @@ int main() {
     glFrontFace(GL_CCW);
     glEnable(GL_CULL_FACE); glCullFace(GL_BACK);
 
-    Check((int)coast.size() <= 512, "coast size > 512");
-    glUseProgram(prog);
-    glUniform1i(uCoastCount, (GLint)coast.size());
-    glUniform2fv(uCoastLoc, (GLsizei)coast.size(), (const float*)coast.data());
-
     auto t0 = std::chrono::high_resolution_clock::now();
+
+    // 帧循环
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
+
+        // F5 热重载
+        if (gReload) {
+            gReload = false;
+            std::vector<glm::vec2> loaded;
+            if (loadCoastFromFile(coastPath.c_str(), loaded)) {
+                ensureCCW(loaded);
+                coast.swap(loaded);
+                scene.destroy();
+                scene = buildSceneByPolys(coast, seaY, landY, 1337.0f);
+                std::fprintf(stderr, "[info] reloaded %zu points from %s\n", coast.size(), coastPath.c_str());
+            }
+            else {
+                std::fprintf(stderr, "[warn] reload failed: cannot open %s\n", coastPath.c_str());
+            }
+        }
 
         glm::vec3 f = gCam.fwd(), r = gCam.right(), up(0, 1, 0);
         float spd = gCam.speed * (gKeys[GLFW_KEY_LEFT_SHIFT] ? 2.f : 1.f);
@@ -461,6 +522,23 @@ int main() {
         glUniform1f(uWSpeed, +0.5f);
         glUniform1f(uFDuty, 0.22f);
         glUniform1f(uRimW, 0.22f);
+
+        // 将海岸坐标作为 uniform 传入（限制 MAX_COAST=512）
+        const int MAX_COAST = 512;
+        int n = (int)coast.size();
+        if (n > MAX_COAST) {
+            static std::vector<glm::vec2> tmp;
+            tmp.clear();
+            int step = (n + MAX_COAST - 1) / MAX_COAST;
+            for (int i = 0; i < n; i += step) tmp.push_back(coast[i]);
+            while ((int)tmp.size() < 3 && (int)tmp.size() < n) tmp.push_back(coast[(int)tmp.size()]);
+            glUniform1i(uCoastCount, (GLint)tmp.size());
+            glUniform2fv(uCoastLoc, (GLsizei)tmp.size(), (const float*)tmp.data());
+        }
+        else {
+            glUniform1i(uCoastCount, n);
+            glUniform2fv(uCoastLoc, n, (const float*)coast.data());
+        }
 
         // 网格参数（F3）
         glUniform1i(uGridOn, gGrid ? 1 : 0);
