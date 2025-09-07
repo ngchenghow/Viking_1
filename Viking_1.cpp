@@ -1,24 +1,14 @@
-﻿// main.cpp — Island + Plateaus with White Cliffs + Near-Shore Foam Waves
-//             （CCW，泡沫曲度严格匹配海岸SDF 等距偏移曲线）
+﻿// main.cpp — Island + Plateaus (polygon coords) + Near-Shore Foam (poly SDF)
+// 固化白带可见性：用 SDF 在地面上着色白带（-uLandRimWidth <= s <= 0）
+//
 // Deps (vcpkg): glfw3 glad glm
 // Build (MSVC x64):
 //   vcpkg install glfw3 glad glm
 //   cl /EHsc /std:c++20 /W4 main.cpp ^
 //      /I"%VCPKG_ROOT%\\installed\\x64-windows\\include" ^
 //      /D_CRT_SECURE_NO_WARNINGS /MD ^
-//      /Fe:island_plateau_realcliff_foam.exe ^
+//      /Fe:island_plateau_poly_foam.exe ^
 //      /link /LIBPATH:"%VCPKG_ROOT%\\installed\\x64-windows\\lib" glfw3.lib glad.lib opengl32.lib
-//
-// 运行：WASD/空格/左Ctrl移动，鼠标视角，TAB 捕获/释放，F1 线框，F2 背面剔除
-//
-// 场景结构：
-//   - 平坦岛面（轻微高度扰动）、海岸窄白边（rim）、水面
-//   - 多个圆盘状高原（顶部平、侧壁陡崖为白色）
-// 着色：
-//   - 片元着色器内用“海岸隐式函数”的近似SDF（phi=r-R(theta)）求近岸距离 s
-//   - 在 s∈[0, uFoamWidth] 区域沿法线铺设条纹（等距偏移），由 sawtooth+占空比生成泡沫
-//   - 因为条纹相位仅依赖 SDF 距离，故条纹曲线与海岸曲率保持一致（严格平行）
-//   - 轻微 FBM 抖动只影响相位不改变曲率（不会扭曲条纹的几何平行性）
 
 #include <cstdio>
 #include <cstdlib>
@@ -37,656 +27,453 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
-// 简易断言：失败则打印并退出
-static void Check(bool ok, const char* msg) {
-    if (!ok) { std::fprintf(stderr, "Error: %s\n", msg); std::exit(EXIT_FAILURE); }
-}
+static void Check(bool ok, const char* msg) { if (!ok) { std::fprintf(stderr, "Error: %s\n", msg); std::exit(EXIT_FAILURE); } }
 
 #if _DEBUG
-// —— OpenGL Debug 输出：便于定位GL错误，仅在 Debug 下启用 ——
 static void APIENTRY DebugCB(GLenum, GLenum type, GLuint, GLenum severity, GLsizei, const GLchar* msg, const void*) {
-    if (severity != GL_DEBUG_SEVERITY_NOTIFICATION)
-        std::fprintf(stderr, "[GL %s] %s\n", type == GL_DEBUG_TYPE_ERROR ? "ERROR" : "MSG", msg);
+    if (severity != GL_DEBUG_SEVERITY_NOTIFICATION) std::fprintf(stderr, "[GL %s] %s\n", type == GL_DEBUG_TYPE_ERROR ? "ERROR" : "MSG", msg);
 }
 static void EnableGLDebugIfAvailable() {
     int flags = 0; glGetIntegerv(GL_CONTEXT_FLAGS, &flags);
     if ((flags & GL_CONTEXT_FLAG_DEBUG_BIT) && glDebugMessageCallback) {
-        glEnable(GL_DEBUG_OUTPUT);
-        glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+        glEnable(GL_DEBUG_OUTPUT); glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
         glDebugMessageCallback(DebugCB, nullptr);
-        if (glDebugMessageControl)
-            glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DEBUG_SEVERITY_NOTIFICATION, 0, nullptr, GL_FALSE);
+        if (glDebugMessageControl) glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DEBUG_SEVERITY_NOTIFICATION, 0, nullptr, GL_FALSE);
     }
 }
 #else
 static void EnableGLDebugIfAvailable() {}
 #endif
 
-// ======================= 轻量 1D fBm 噪声（用于地表、水面细微扰动/抖动） =======================
-// 整数哈希：将 32 位整数打散到均匀分布（确定性随机）
-static uint32_t h32(uint32_t x) {
-    x ^= x >> 16; x *= 0x7feb352dU;
-    x ^= x >> 15; x *= 0x846ca68bU;
-    x ^= x >> 16; return x;
-}
-// 将整型映射到 [0,1) 浮点
+// --- noise ---
+static uint32_t h32(uint32_t x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x; }
 static float r01(uint32_t x) { return (x >> 8) * (1.0f / 16777216.0f); }
-// 1D value-noise：线性插值（用 smootherstep 平滑）
 static float noise1(float t) {
     int i = (int)floor(t); float f = t - i;
-    float a = r01(h32((uint32_t)i * 2654435761U));
-    float b = r01(h32((uint32_t)(i + 1) * 2654435761U));
-    float s = f * f * (3.f - 2.f * f);      // smootherstep
-    return a + (b - a) * s;
+    float a = r01(h32((uint32_t)i * 2654435761U)), b = r01(h32((uint32_t)(i + 1) * 2654435761U));
+    float s = f * f * (3.f - 2.f * f); return a + (b - a) * s;
 }
-// 1D fBm：叠加多频噪声，返回 0~1 左右的平滑值
 static float fbm1(float t, int oct = 4, float lac = 2.f, float gain = 0.5f) {
-    float amp = 1, f = 1, sum = 0, n = 0;
-    for (int i = 0; i < oct; i++) { sum += noise1(t * f) * amp; n += amp; f *= lac; amp *= gain; }
-    return sum / (n > 0 ? n : 1);
+    float amp = 1, f = 1, sum = 0, n = 0; for (int i = 0; i < oct; i++) { sum += noise1(t * f) * amp; n += amp; f *= lac; amp *= gain; } return sum / (n > 0 ? n : 1);
 }
 
-// ======================= 基础网格数据结构（带 vao/vbo/ebo + 上传/销毁） =======================
-struct Vtx { glm::vec3 pos; glm::vec3 nrm; float kind; float band; };
-// kind 用于着色器内部快速分材质：0=地面 1=高原平顶 2=水面 3=海岸窄白带rim 4=高原侧壁（白色陡崖）
+// --- mesh ---
+struct Vtx { glm::vec3 pos, nrm; float kind, band; };
 struct Mesh {
     std::vector<Vtx> v; std::vector<uint32_t> i; GLuint vao = 0, vbo = 0, ebo = 0;
-    // 上传到 GPU
     void upload() {
-        if (!vao) glGenVertexArrays(1, &vao);
-        if (!vbo) glGenBuffers(1, &vbo);
-        if (!ebo) glGenBuffers(1, &ebo);
+        if (!vao) glGenVertexArrays(1, &vao); if (!vbo) glGenBuffers(1, &vbo); if (!ebo) glGenBuffers(1, &ebo);
         glBindVertexArray(vao);
-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(v.size() * sizeof(Vtx)), v.data(), GL_STATIC_DRAW);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(i.size() * sizeof(uint32_t)), i.data(), GL_STATIC_DRAW);
-        // layout(location=0..3) 对应 VS 中的 aPos/aNrm/aKind/aBand
+        glBindBuffer(GL_ARRAY_BUFFER, vbo); glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(v.size() * sizeof(Vtx)), v.data(), GL_STATIC_DRAW);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo); glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(i.size() * sizeof(uint32_t)), i.data(), GL_STATIC_DRAW);
         glEnableVertexAttribArray(0); glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)offsetof(Vtx, pos));
         glEnableVertexAttribArray(1); glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)offsetof(Vtx, nrm));
         glEnableVertexAttribArray(2); glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)offsetof(Vtx, kind));
         glEnableVertexAttribArray(3); glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)offsetof(Vtx, band));
         glBindVertexArray(0);
     }
-    // 释放 GPU 资源
-    void destroy() {
-        if (ebo) glDeleteBuffers(1, &ebo);
-        if (vbo) glDeleteBuffers(1, &vbo);
-        if (vao) glDeleteVertexArrays(1, &vao);
-        vao = vbo = ebo = 0;
-    }
+    void destroy() { if (ebo) glDeleteBuffers(1, &ebo); if (vbo) glDeleteBuffers(1, &vbo); if (vao) glDeleteVertexArrays(1, &vao); vao = vbo = ebo = 0; }
 };
-static inline uint32_t addV(Mesh& m, const Vtx& v) { m.v.push_back(v); return (uint32_t)m.v.size() - 1; }
 static inline void addTriI(Mesh& m, uint32_t a, uint32_t b, uint32_t c) { m.i.push_back(a); m.i.push_back(b); m.i.push_back(c); }
-static void addTri(Mesh& m, const Vtx& a, const Vtx& b, const Vtx& c) {
-    uint32_t s = (uint32_t)m.v.size(); m.v.push_back(a); m.v.push_back(b); m.v.push_back(c);
-    m.i.push_back(s); m.i.push_back(s + 1); m.i.push_back(s + 2);
+
+// --- poly utils ---
+static float cross2(const glm::vec2& a, const glm::vec2& b) { return a.x * b.y - a.y * b.x; }
+static float area2(const std::vector<glm::vec2>& P) {
+    long double A = 0; size_t n = P.size();
+    for (size_t i = 0; i < n; i++) { const auto& p = P[i]; const auto& q = P[(i + 1) % n]; A += (long double)p.x * q.y - (long double)p.y * q.x; } return (float)(A * 0.5);
+}
+static bool isCCW(const std::vector<glm::vec2>& P) { return area2(P) > 0; }
+
+static bool pointInTri(const glm::vec2& p, const glm::vec2& a, const glm::vec2& b, const glm::vec2& c) {
+    glm::vec2 v0 = c - a, v1 = b - a, v2 = p - a;
+    float d00 = glm::dot(v0, v0), d01 = glm::dot(v0, v1), d11 = glm::dot(v1, v1), d20 = glm::dot(v2, v0), d21 = glm::dot(v2, v1);
+    float denom = d00 * d11 - d01 * d01; if (std::fabs(denom) < 1e-12f) return false;
+    float v = (d11 * d20 - d01 * d21) / denom, w = (d00 * d21 - d01 * d20) / denom, u = 1.f - v - w;
+    return (u > -1e-6f && v > -1e-6f && w > -1e-6f);
 }
 
-// ======================= 海岸形状参数化（超椭圆 + 海湾凹陷 + 周期粗糙） =======================
-// 超椭圆半径：|x/rx|^n + |z/rz|^n = 1 的极坐标半径 R(theta)
-static float superellipseRadius(float angle, float rx, float rz, float n) {
-    float ca = std::fabs(std::cos(angle)), sa = std::fabs(std::sin(angle));
-    float k = std::pow(std::pow(ca, n) / std::pow(rx, n) + std::pow(sa, n) / std::pow(rz, n), 1.0f / n);
-    return 1.0f / std::max(k, 1e-6f);
-}
-// 基础半径 Rb(theta)：超椭圆 * 若干高斯“海湾”凹陷 * 周期性粗糙（fbm）
-static float baseRadius(
-    float a, float rx, float rz, float n,
-    const std::vector<glm::vec2>& bays, float bayDepth,
-    float rough, float seed
-) {
-    float R = superellipseRadius(a, rx, rz, n);
-    // 海湾凹陷：以高斯 dent 在角度域制造凹陷（b.x=角度中心, b.y=角宽）
-    for (auto b : bays) {
-        float da = std::atan2(std::sin(a - b.x), std::cos(a - b.x));   // wrap 到 [-pi,pi]
-        float dent = std::exp(-(da * da) / (2.0f * b.y * b.y));
-        R *= (1.0f - bayDepth * dent);
-    }
-    // 周期粗糙：对 R 再乘上 1 + rough*(fbm-0.5)
-    float n1 = fbm1(seed + 1.5f * std::cos(a) + 0.8f * std::sin(a), 4, 2.0f, 0.55f);
-    R *= (1.0f + rough * (n1 - 0.5f));
-    return R;
-}
-
-// ======================= 圆盘高原（顶/侧壁）生成 =======================
-struct Plateau { glm::vec2 c; float r0; float r1; float h; };
-// 高原顶部盖片（kind=1，法线=Y+）
-static void addPlateauCap(Mesh& m, const Plateau& s, float yTop, int seg = 160) {
-    const float inset = 0.02f * s.r0;                // 稍微内缩避免与侧壁共面重合
-    std::vector<uint32_t> ring(seg);
-    glm::vec3 N(0, 1, 0);
-    for (int k = 0; k < seg; ++k) {
-        float a = (float)k / seg * glm::two_pi<float>();
-        glm::vec2 dir(std::cos(a), std::sin(a));
-        glm::vec3 p(s.c.x + dir.x * (s.r0 - inset), yTop, s.c.y + dir.y * (s.r0 - inset));
-        ring[k] = addV(m, Vtx{ p,N,1.f,0.f });
-    }
-    glm::vec3 C(s.c.x, yTop, s.c.y);
-    uint32_t ic = addV(m, Vtx{ C,N,1.f,0.f });
-    // 以中心扇形三角形缝合
-    for (int k = 0; k < seg; ++k) { int k1 = (k + 1) % seg; addTriI(m, ic, ring[k1], ring[k]); }
-}
-// 高原侧壁（kind=4，法线朝外，白色陡崖）
-static void addPlateauCliff(Mesh& m, const Plateau& s, float yTop, float yBottom, int seg = 160) {
-    std::vector<uint32_t> top(seg), bot(seg);
-    for (int k = 0; k < seg; ++k) {
-        float a = (float)k / seg * glm::two_pi<float>();
-        glm::vec2 dir(std::cos(a), std::sin(a));
-        glm::vec3 nrm(dir.x, 0, dir.y);                      // 水平外法线
-        glm::vec3 pt(s.c.x + dir.x * s.r0, yTop, s.c.y + dir.y * s.r0);
-        glm::vec3 pb(s.c.x + dir.x * s.r0, yBottom, s.c.y + dir.y * s.r0);
-        top[k] = addV(m, Vtx{ pt,nrm,4.f,0.f });
-        bot[k] = addV(m, Vtx{ pb,nrm,4.f,0.f });
-    }
-    // 拉直墙两三角
-    for (int k = 0; k < seg; ++k) {
-        int k1 = (k + 1) % seg;
-        addTriI(m, top[k], top[k1], bot[k]);
-        addTriI(m, top[k1], bot[k1], bot[k]);
-    }
-}
-
-// ======================= 整个岛屿（地面 + 海岸rim + 水面 + 高原）生成 =======================
-static Mesh buildFlatIsland(float worldR, int seg, float seaY, float landY, float seed) {
-    // —— 海岸基础形状参数（超椭圆 + 海湾） ——
-    float rx = worldR * 1.35f, rz = worldR * 1.00f, n = 3.4f;
-    std::vector<glm::vec2> bays = {
-        { glm::radians(-70.0f), 0.30f },
-        { glm::radians(20.0f),  0.25f },
-        { glm::radians(150.0f), 0.28f }
-    };
-    float bayDepth = 0.22f;      // 海湾凹陷强度
-    float rough = 0.10f;         // 周期粗糙强度
-
-    // 预采样 Rb(theta) 以便 CPU 侧构网
-    std::vector<float> Rb(seg);
-    for (int k = 0; k < seg; k++) {
-        float a = (float)k / seg * glm::two_pi<float>();
-        Rb[k] = baseRadius(a, rx, rz, n, bays, bayDepth, rough, seed);
-    }
-
-    Mesh m;
-
-    // —— 地面：同心环带三角带（顶部略微高度扰动，法线后续平均） ——
-    const int Nr = 28;  // 向心段数（越大越圆滑）
-    std::vector<std::vector<uint32_t>> vid(Nr + 1, std::vector<uint32_t>(seg));
-    size_t landVtxBegin = m.v.size();
-    size_t landIdxBegin = m.i.size();
-
-    for (int j = 0; j <= Nr; ++j) {
-        float t = (float)j / (float)Nr;                 // 半径比例
-        for (int k = 0; k < seg; ++k) {
-            float a = (float)k / seg * glm::two_pi<float>();
-            float R = Rb[k] * t;
-            glm::vec3 p{ std::cos(a) * R, landY, std::sin(a) * R };
-            // 轻微高度扰动（不改变法线大致方向）
-            float dy = 0.02f * worldR * (fbm1(0.05f * p.x + 0.04f * p.z + seed) - 0.5f);
-            p.y += dy;
-            vid[j][k] = addV(m, Vtx{ p, glm::vec3(0,1,0), 0.f, 0.f }); // kind=0 地面
+static void earClipTriangulate(const std::vector<glm::vec2>& poly, std::vector<uint32_t>& out) {
+    size_t n = poly.size(); out.clear(); if (n < 3) return;
+    if (!isCCW(poly)) { std::vector<glm::vec2> tmp = poly; std::reverse(tmp.begin(), tmp.end()); earClipTriangulate(tmp, out); return; }
+    std::vector<int> V(n); for (size_t i = 0; i < n; i++) V[i] = (int)i;
+    int guard = 0;
+    while (V.size() > 3 && guard++ < 10000) {
+        bool cut = false;
+        for (size_t k = 0; k < V.size(); k++) {
+            int i0 = V[(k + V.size() - 1) % V.size()], i1 = V[k], i2 = V[(k + 1) % V.size()];
+            const auto& a = poly[i0]; const auto& b = poly[i1]; const auto& c = poly[i2];
+            if (cross2(b - a, c - b) <= 0) continue; // 凸角
+            bool any = false; for (size_t j = 0; j < V.size(); j++) { int ij = V[j]; if (ij == i0 || ij == i1 || ij == i2) continue; if (pointInTri(poly[ij], a, b, c)) { any = true; break; } }
+            if (any) continue;
+            out.push_back((uint32_t)i0); out.push_back((uint32_t)i1); out.push_back((uint32_t)i2);
+            V.erase(V.begin() + (int)k); cut = true; break;
         }
+        if (!cut) break;
     }
-    // 按环带缝合三角
-    for (int j = 0; j < Nr; ++j) {
-        for (int k = 0; k < seg; ++k) {
-            int k1 = (k + 1) % seg;
-            uint32_t v00 = vid[j][k], v01 = vid[j][k1];
-            uint32_t v10 = vid[j + 1][k], v11 = vid[j + 1][k1];
-            addTriI(m, v00, v11, v10);
-            addTriI(m, v00, v01, v11);
-        }
+    if (V.size() == 3) { out.push_back((uint32_t)V[0]); out.push_back((uint32_t)V[1]); out.push_back((uint32_t)V[2]); }
+}
+
+// 射线法
+static bool pointInPoly_stable(const glm::vec2& p, const std::vector<glm::vec2>& P) {
+    bool c = false; int n = (int)P.size();
+    for (int i = 0, j = n - 1; i < n; j = i++) {
+        glm::vec2 a = P[i], b = P[j];
+        float dy = b.y - a.y; if (std::fabs(dy) < 1e-9f) continue;
+        bool cond = ((a.y > p.y) != (b.y > p.y)) && (p.x < (b.x - a.x) * (p.y - a.y) / dy + a.x);
+        if (cond) c = !c;
     }
-    // 对地面法线做平均（邻三角累加，最后归一化）
-    size_t landIdxEnd = m.i.size();
-    for (size_t idx = landIdxBegin; idx + 2 < landIdxEnd; idx += 3) {
-        uint32_t i0 = m.i[idx], i1 = m.i[idx + 1], i2 = m.i[idx + 2];
+    return c;
+}
+
+// 外法线（CCW）：(-e.y, e.x)
+static std::vector<glm::vec2> offsetMiter(const std::vector<glm::vec2>& P, float d, float miterLimit = 4.0f) {
+    size_t n = P.size(); std::vector<glm::vec2> Q(n);
+    for (size_t i = 0; i < n; i++) {
+        const auto& pm = P[(i + n - 1) % n]; const auto& p = P[i]; const auto& pn = P[(i + 1) % n];
+        glm::vec2 e0 = glm::normalize(p - pm), e1 = glm::normalize(pn - p);
+        glm::vec2 n0 = { -e0.y, e0.x }, n1 = { -e1.y, e1.x };
+        glm::vec2 m = glm::normalize(n0 + n1);
+        float denom = glm::dot(m, n0); float scale = (std::fabs(denom) < 1e-6f) ? 1.f : (1.f / denom);
+        scale = std::clamp(scale, -miterLimit, miterLimit);
+        Q[i] = p + m * (d * scale);
+    }
+    return Q;
+}
+
+// 顶面法线：cross(p2-p0, p1-p0)
+static void accumulateAndNormalizeTopNormals(Mesh& m, size_t baseV, size_t baseI) {
+    for (size_t t = baseI; t < m.i.size(); t += 3) {
+        uint32_t i0 = m.i[t], i1 = m.i[t + 1], i2 = m.i[t + 2];
         glm::vec3 p0 = m.v[i0].pos, p1 = m.v[i1].pos, p2 = m.v[i2].pos;
-        glm::vec3 nrm = glm::normalize(glm::cross(p1 - p0, p2 - p0));
-        m.v[i0].nrm += nrm; m.v[i1].nrm += nrm; m.v[i2].nrm += nrm;
+        glm::vec3 n = glm::normalize(glm::cross(p2 - p0, p1 - p0));
+        m.v[i0].nrm += n; m.v[i1].nrm += n; m.v[i2].nrm += n;
     }
-    for (size_t vi = landVtxBegin; vi < m.v.size(); ++vi) {
-        if (m.v[vi].kind == 0.f) {
-            glm::vec3 n = m.v[vi].nrm;
-            if (glm::dot(n, n) < 1e-8f) n = glm::vec3(0, 1, 0);
-            m.v[vi].nrm = glm::normalize(n);
-        }
+    for (size_t vi = baseV; vi < m.v.size(); ++vi) {
+        glm::vec3 n = m.v[vi].nrm; if (glm::dot(n, n) < 1e-10f) n = { 0,1,0 }; m.v[vi].nrm = glm::normalize(n);
     }
-
-    // —— 多个圆盘高原（顶部+侧壁） ——
-    Plateau pts[] = {
-        {{-0.28f * rx,  0.08f * rz}, 0.55f * worldR, 0.90f * worldR, 0.80f}, // c, r0, r1(未用), h
-        {{ 0.46f * rx, -0.22f * rz}, 0.42f * worldR, 0.80f * worldR, 0.55f},
-        {{ 0.06f * rx,  0.05f * rz}, 0.32f * worldR, 0.70f * worldR, 0.45f},
-    };
-    for (auto& s : pts) {
-        float yTop = landY + s.h, yBot = landY;
-        addPlateauCap(m, s, yTop, 200);
-        addPlateauCliff(m, s, yTop, yBot, 200);
-    }
-
-    // —— 海岸窄白带 rim（kind=3）：顺着海岸等距外扩一小条（视觉上是“岸线高光边”） ——
-    float rimLift = 0.06f;     // 抬高到地面之上，避免与地面 z-fight
-    float rimWidth = 0.12f;    // 径向外扩宽度
-    int segN = (int)Rb.size();
-    for (int k = 0; k < segN; k++) {
-        int k1 = (k + 1) % segN;
-        float a0 = (float)k / segN * glm::two_pi<float>();
-        float a1 = (float)k1 / segN * glm::two_pi<float>();
-        glm::vec2 p0(std::cos(a0) * Rb[k], std::sin(a0) * Rb[k]);
-        glm::vec2 p1(std::cos(a1) * Rb[k1], std::sin(a1) * Rb[k1]);
-        glm::vec2 t2 = glm::normalize(p1 - p0);       // 切向量
-        glm::vec2 n2(-t2.y, t2.x);                    // 外法线（2D）
-        glm::vec3 i0(p0.x, landY + rimLift, p0.y);
-        glm::vec3 i1(p1.x, landY + rimLift, p1.y);
-        glm::vec3 o0(p0.x + n2.x * rimWidth, landY + rimLift, p0.y + n2.y * rimWidth);
-        glm::vec3 o1(p1.x + n2.x * rimWidth, landY + rimLift, p1.y + n2.y * rimWidth);
-        glm::vec3 N = glm::normalize(glm::cross(i1 - i0, o0 - i0)); // 近似上向法线
-        Vtx A{ i0,N,3.f,0 }, B{ i1,N,3.f,0 }, C{ o0,N,3.f,0 }, D{ o1,N,3.f,0 };
-        addTri(m, A, C, B); addTri(m, B, C, D);
-    }
-
-    // —— 水面（kind=2）：一块大矩形，片元里用 SDF 判断“近岸距离”并画泡沫 ——
-    {
-        float W = worldR * 6.f;
-        float wy = seaY - 0.04f;             // 稍微压低，避免与地面穿插
-        glm::vec3 nW(0, 1, 0);
-        glm::vec3 p0{ -W,wy,-W }, p1{ W,wy,-W }, p2{ -W,wy,W }, p3{ W,wy,W };
-        Vtx A{ p0,nW,2.f,0 }, B{ p1,nW,2.f,0 }, C{ p2,nW,2.f,0 }, D{ p3,nW,2.f,0 };
-        addTri(m, A, C, B); addTri(m, B, C, D);
-    }
-
-    m.upload();
-    return m;
 }
 
-// ======================= 顶点 & 片元着色器 =======================
-// 顶点：仅做常规变换，输出世界坐标与世界法线（用于光照），以及 kind
+// --- shaders ---
 static const char* VS = R"GLSL(
 #version 330 core
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNrm;
 layout(location=2) in float aKind;
 layout(location=3) in float aBand;
-
-uniform mat4 uMVP, uModel;
-uniform mat3 uNrmMat;
-
-out vec3 vPosW;
-out vec3 vNrmW;
-out float vKind;
-
-void main(){
-    vec4 pw = uModel * vec4(aPos,1.0);
-    vPosW = pw.xyz;
-    vNrmW = normalize(uNrmMat * aNrm);
-    vKind = aKind;
-    gl_Position = uMVP * vec4(aPos,1.0);
-}
+uniform mat4 uMVP, uModel; uniform mat3 uNrmMat;
+out vec3 vPosW; out vec3 vNrmW; out float vKind;
+void main(){ vec4 pw=uModel*vec4(aPos,1.0); vPosW=pw.xyz; vNrmW=normalize(uNrmMat*aNrm); vKind=aKind; gl_Position=uMVP*vec4(aPos,1.0); }
 )GLSL";
 
-// === 片元着色器：海岸隐式函数近似 SDF，令泡沫条纹是海岸的等距偏移曲线（曲率一致） ===
 static const char* FS = R"GLSL(
 #version 330 core
-in vec3 vPosW;
-in vec3 vNrmW;
-in float vKind;
-
-uniform vec3 uCam;
-uniform vec3 uLightDir;
-uniform vec3 uHorizon;
-uniform vec3 uSky;
-uniform float uFogNear;
-uniform float uFogFar;
-
-// —— 近岸泡沫相关（与 CPU 侧参数一致，以保证 coastSDF 一致性）——
-uniform float uTime;        // 时间
-uniform float uRx, uRz, uNExp;
-uniform int   uBayCount;
-uniform vec2  uBays[8];     // (angle, width) 海湾参数
-uniform float uBayDepth;
-uniform float uRough;
-uniform float uSeed;
-
-uniform float uFoamWidth;   // 近岸泡沫作用宽度（海侧，沿 SDF 法线方向的真实距离）
-uniform float uFoamFreq;    // 条/米（沿 SDF 法线方向测量）
-uniform float uWaveSpeed;   // 泡沫相位沿法线移动速度：>0 往岸移动（s 减小）
-uniform float uFoamDuty;    // 占空比（0~1），决定白条宽度
-
+in vec3 vPosW; in vec3 vNrmW; in float vKind;
+uniform vec3 uCam, uLightDir, uHorizon, uSky; uniform float uFogNear, uFogFar, uTime;
+const int MAX_COAST=512; uniform int uCoastCount; uniform vec2 uCoast[MAX_COAST];
+uniform float uFoamWidth, uFoamFreq, uWaveSpeed, uFoamDuty;
+uniform float uLandRimWidth; // 新增：地面白带宽度（世界坐标）
 out vec4 FragColor;
 
-// ———— 基础配色（简洁mono风格） ————
-vec3 landColor(){    return vec3(0.80,0.82,0.66); }
-vec3 plateauColor(){ return landColor() * 0.90; }
-vec3 waterColor(){   return vec3(0.50,0.68,0.84); }
-vec3 rimColor()  {   return vec3(0.97,0.97,0.99); }
-vec3 cliffColor(){   return vec3(0.97,0.97,0.99); }
+vec3 landColor(){return vec3(0.80,0.82,0.66);}
+vec3 plateauColor(){return landColor()*0.90;}
+vec3 waterColor(){return vec3(0.50,0.68,0.84);}
+vec3 rimColor(){return vec3(0.97,0.97,0.99);}
+vec3 cliffColor(){return vec3(0.97,0.97,0.99);}
 
-// ———— 与 CPU 一致的 1D fBm，用于轻微抖动相位（不改变曲率，仅扰动条纹位置） ————
 uint h32(uint x){ x^=x>>16; x*=0x7feb352du; x^=x>>15; x*=0x846ca68bu; x^=x>>16; return x; }
 float r01(uint x){ return float(x>>8u)*(1.0/16777216.0); }
-float noise1(float t){
-    float fi=floor(t); int i=int(fi); float f=t-fi;
-    float a=r01(h32(uint(i)*2654435761u));
-    float b=r01(h32(uint(i+1)*2654435761u));
-    float s=f*f*(3.0-2.0*f);
-    return a+(b-a)*s;
-}
-float fbm1_4(float t){
-    float amp=1.0,f=1.0,sum=0.0,n=0.0;
-    for(int i=0;i<4;i++){ sum+=noise1(t*f)*amp; n+=amp; f*=2.0; amp*=0.5; }
-    return sum/max(n,1e-6);
-}
+float noise1(float t){ float fi=floor(t); int i=int(fi); float f=t-fi; float a=r01(h32(uint(i)*2654435761u)); float b=r01(h32(uint(i+1)*2654435761u)); float s=f*f*(3.0-2.0*f); return a+(b-a)*s; }
+float fbm1_4(float t){ float amp=1.0,f=1.0,sum=0.0,n=0.0; for(int i=0;i<4;i++){ sum+=noise1(t*f)*amp; n+=amp; f*=2.0; amp*=0.5; } return sum/max(n,1e-6); }
 
-// ———— 超椭圆 + 海湾 + 周期粗糙，与 CPU 的 baseRadius 等价 ————
-float superellipseRadius(float ang, float rx, float rz, float nexp){
-    float ca=abs(cos(ang)), sa=abs(sin(ang));
-    float rxn=pow(rx,nexp), rzn=pow(rz,nexp);
-    float k=pow(pow(ca,nexp)/rxn + pow(sa,nexp)/rzn, 1.0/nexp);
-    return 1.0/max(k,1e-6);
+float distSeg(vec2 p, vec2 a, vec2 b){
+    vec2 ab=b-a; float t=clamp(dot(p-a,ab)/max(dot(ab,ab),1e-8),0.0,1.0);
+    vec2 q=a+t*ab; return length(p-q);
 }
-float baseRadiusGL(float ang){
-    float R=superellipseRadius(ang,uRx,uRz,uNExp);
-    for(int i=0;i<uBayCount;i++){
-        vec2 b=uBays[i];
-        float da=atan(sin(ang-b.x),cos(ang-b.x));          // wrap 到 [-pi,pi]
-        float dent=exp(-(da*da)/(2.0*b.y*b.y));
-        R*= (1.0 - uBayDepth*dent);
+bool pointInPoly(vec2 p){
+    bool c=false; int n=uCoastCount;
+    for(int i=0,j=n-1;i<n;j=i++){
+        vec2 a=uCoast[i], b=uCoast[j];
+        float dy=b.y-a.y; if(abs(dy)<1e-9) continue;
+        bool cond=((a.y>p.y)!=(b.y>p.y)) && (p.x < (b.x-a.x)*(p.y-a.y)/dy + a.x);
+        if(cond) c=!c;
     }
-    float n1=fbm1_4(uSeed + 1.5*cos(ang) + 0.8*sin(ang));
-    R*= (1.0 + uRough*(n1-0.5));
-    return R;
+    return c;
 }
-
-// ———— 数值导数 R'(theta)（对角度做中心差分） ————
-float dRb_dAng(float ang){
-    float h = 0.0045;                                   // 小步长（经验值）
-    return (baseRadiusGL(ang+h) - baseRadiusGL(ang-h)) / (2.0*h);
-}
-
-// ———— 近似 SDF：phi(x,z) = r - R(theta)；sdf = phi / |∇phi| ————
-//   推导：r = sqrt(x^2+z^2), theta = atan2(z,x)
-//   ∂phi/∂x = ∂r/∂x - R'(theta)*∂theta/∂x
-//           = x/r - R'(theta)*(-z/r^2)
-//           = x/r + (z/r^2)*R'(theta)
-//   ∂phi/∂z = z/r - R'(theta)*( x/r^2)
-//           = z/r - (x/r^2)*R'(theta)
-//   故 ∇phi = (x/r + (z/r^2)R',  z/r - (x/r^2)R')
-float coastSDF(vec2 xz){
-    float x = xz.x, z = xz.y;
-    float r2 = max(dot(xz,xz), 1e-6);
-    float r  = sqrt(r2);
-    float ang = atan(z,x);
-    float R  = baseRadiusGL(ang);
-    float dR = dRb_dAng(ang);
-    vec2 g = vec2(x/r + (z/r2)*dR,
-                  z/r - (x/r2)*dR);
-    float phi = r - R;                                  // phi>0：在海侧；phi=0：海岸线
-    return phi / max(length(g), 1e-6);                  // 归一化为“真实距离”（近似）
+float coastSDF(vec2 p){
+    float d=1e9; for(int i=0;i<uCoastCount;i++){ vec2 a=uCoast[i], b=uCoast[(i+1)%uCoastCount]; d=min(d, distSeg(p,a,b)); }
+    return pointInPoly(p)? -d : d;
 }
 
 void main(){
-    // 基础颜色（按 kind）
-    vec3 base=(vKind>3.5)?cliffColor():
-              (vKind>2.5)?rimColor():
-              (vKind>1.5)?waterColor():
-              (vKind>0.5)?plateauColor():landColor();
+    vec3 base=(vKind>3.5)?cliffColor():(vKind>2.5)?rimColor():(vKind>1.5)?waterColor():(vKind>0.5)?plateauColor():landColor();
+    vec3 N=normalize(vNrmW), L=normalize(-uLightDir); float diff=max(dot(N,L),0.0);
+    vec3 col=base*(0.85 + (vKind>1.5?0.12:0.08)*diff);
 
-    // 简单定向漫反射（略压平，避免高光跳变）
-    vec3 N=normalize(vNrmW);
-    vec3 L=normalize(-uLightDir);
-    float diff=max(dot(N,L),0.0);
-    float kFlat=0.85;
-    float kVar =(vKind>1.5?0.12:0.08);
-    vec3 col=base*(kFlat + kVar*diff);
-
-    // —— 仅对水面（kind∈(1.5,2.5)）叠加“近岸泡沫”逻辑 ——
+    // ---- 海面泡沫（保持）----
     if(vKind>1.5 && vKind<2.5){
-        vec2 xz=vPosW.xz;
-
-        // s = 近似“到海岸的法向距离”，s>0 表示海侧
-        float s = coastSDF(xz);
-
-        // 仅在海侧且处于泡沫作用宽度内才渲染白泡
-        float nearMask = step(0.0,s) * step(s, uFoamWidth);
-
-        // 轻微抖动（改变条纹相位但不改变几何曲率）
-        float nJitter = fbm1_4(dot(xz,vec2(0.22,-0.17)) + 0.15*uTime);
-
-        // 条纹相位：cycles = s*freq + speed*t + jitter
-        // 重要：s 按 SDF “真实距离”，因此等值线严格平行海岸
-        float cycles = s*uFoamFreq + uWaveSpeed*uTime + 2.2*nJitter;
-        float saw = fract(cycles);                       // 0..1 锯齿相位
-        float foam = step(saw, clamp(uFoamDuty,0.0,1.0)) * nearMask;
-
-        // 近岸水色起伏（幅度在近岸最大，远处趋于 0）
-        float nearSoft = smoothstep(uFoamWidth, 0.0, s); // 近岸1，远处0
-        float waterUndulate = 1.0 + 0.04 * nearSoft * sin(s*0.8 - 0.7*uTime + 3.0*nJitter);
-        col *= waterUndulate;
-
-        // Mono 风格：将泡沫区域混到“白色”
-        col = mix(col, rimColor(), foam);
+        vec2 xz=vPosW.xz; float s=coastSDF(xz); float nearMask=step(0.0,s)*step(s,uFoamWidth);
+        float jitter=2.1*fbm1_4(dot(xz,vec2(0.21,-0.17)) + 0.12*uTime);
+        float saw=fract(s*uFoamFreq + uWaveSpeed*uTime + jitter);
+        float foam=step(saw, clamp(uFoamDuty,0.0,1.0))*nearMask;
+        float nearSoft=smoothstep(uFoamWidth,0.0,s);
+        col*= (1.0 + 0.04*nearSoft*sin(s*0.8 - 0.7*uTime + 3.0*jitter));
+        col=mix(col, vec3(0.97), foam);
     }
 
-    // 简单雾
-    float dist=length(uCam - vPosW);
-    float f=clamp((dist - uFogNear)/(uFogFar - uFogNear),0.0,1.0);
-    vec3 fogCol=mix(uHorizon,uSky,0.3);
-    col=mix(col,fogCol,f);
+    // ---- 地面白带（新增，稳定可见）----
+    if(vKind<0.5){
+        float s = coastSDF(vPosW.xz); // 岛内为负
+        float w = max(uLandRimWidth, 1e-4);
+        float mask = step(-w, s) * step(s, 0.0); // -w <= s <= 0
+        // 轻微柔化边缘
+        float soft = smoothstep(-w, -0.7*w, s) * (1.0 - smoothstep(-0.3*w, 0.0, s));
+        col = mix(col, rimColor(), max(mask, soft*0.85));
+    }
 
-    FragColor=vec4(col,1.0);
+    float dist=length(uCam - vPosW), f=clamp((dist-uFogNear)/(uFogFar-uFogNear),0.0,1.0);
+    vec3 fogCol=mix(uHorizon,uSky,0.3); col=mix(col,fogCol,f); FragColor=vec4(col,1.0);
 }
 )GLSL";
 
-// 创建编译/链接着色器小工具
+// --- shader utils ---
 static GLuint mkShader(GLenum t, const char* s) {
     GLuint sh = glCreateShader(t); glShaderSource(sh, 1, &s, nullptr); glCompileShader(sh);
     GLint ok = 0; glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        GLint len = 0; glGetShaderiv(sh, GL_INFO_LOG_LENGTH, &len);
-        std::string log(len, '\0'); glGetShaderInfoLog(sh, len, nullptr, log.data());
-        std::fprintf(stderr, "Shader error:\n%s\n", log.c_str()); std::exit(EXIT_FAILURE);
-    } return sh;
+    if (!ok) { GLint len = 0; glGetShaderiv(sh, GL_INFO_LOG_LENGTH, &len); std::string log(len, '\0'); glGetShaderInfoLog(sh, len, nullptr, log.data()); std::fprintf(stderr, "Shader error:\n%s\n", log.c_str()); std::exit(EXIT_FAILURE); }
+    return sh;
 }
 static GLuint mkProgram(const char* vs, const char* fs) {
     GLuint v = mkShader(GL_VERTEX_SHADER, vs), f = mkShader(GL_FRAGMENT_SHADER, fs);
     GLuint p = glCreateProgram(); glAttachShader(p, v); glAttachShader(p, f); glLinkProgram(p);
     GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        GLint len = 0; glGetProgramiv(p, GL_INFO_LOG_LENGTH, &len);
-        std::string log(len, '\0'); glGetProgramInfoLog(p, len, nullptr, log.data());
-        std::fprintf(stderr, "Link error:\n%s\n", log.c_str()); std::exit(EXIT_FAILURE);
-    } glDeleteShader(v); glDeleteShader(f); return p;
+    if (!ok) { GLint len = 0; glGetProgramiv(p, GL_INFO_LOG_LENGTH, &len); std::string log(len, '\0'); glGetProgramInfoLog(p, len, nullptr, log.data()); std::fprintf(stderr, "Link error:\n%s\n", log.c_str()); std::exit(EXIT_FAILURE); }
+    glDeleteShader(v); glDeleteShader(f); return p;
 }
 
-// ======================= 简单第一人称相机 + 输入 =======================
+// --- camera & input ---
 struct Cam {
-    glm::vec3 pos{ 0,3.0f,9.0f }; float yaw = -90.f, pitch = -15.f, fov = 60.f, speed = 6.f, sens = 0.1f;
-    bool first = true; double lx = 0, ly = 0;
-    glm::vec3 fwd()const {
-        float cy = std::cos(glm::radians(yaw)), sy = std::sin(glm::radians(yaw));
-        float cp = std::cos(glm::radians(pitch)), sp = std::sin(glm::radians(pitch));
-        return glm::normalize(glm::vec3(cy * cp, sp, sy * cp));
-    }
+    glm::vec3 pos{ 0,3.0f,9.0f }; float yaw = -90.f, pitch = -15.f, fov = 60.f, speed = 6.f, sens = 0.1f; bool first = true; double lx = 0, ly = 0;
+    glm::vec3 fwd()const { float cy = std::cos(glm::radians(yaw)), sy = std::sin(glm::radians(yaw)); float cp = std::cos(glm::radians(pitch)), sp = std::sin(glm::radians(pitch)); return glm::normalize(glm::vec3(cy * cp, sp, sy * cp)); }
     glm::vec3 right()const { return glm::normalize(glm::cross(fwd(), { 0,1,0 })); }
     glm::mat4 view()const { return glm::lookAt(pos, pos + fwd(), { 0,1,0 }); }
 };
+static Cam gCam;
 static bool gKeys[512]{}, gWire = false, gCap = true, gCull = true;
-// 键盘：WASD移动、空格/LeftCtrl 上下、F1 线框、F2 背剔、Tab 捕获鼠标
+
 static void keyCB(GLFWwindow* w, int k, int, int a, int) {
     if (k >= 0 && k < 512) { if (a == GLFW_PRESS) gKeys[k] = true; else if (a == GLFW_RELEASE) gKeys[k] = false; }
     if (k == GLFW_KEY_ESCAPE && a == GLFW_PRESS) glfwSetWindowShouldClose(w, 1);
     if (k == GLFW_KEY_F1 && a == GLFW_PRESS) gWire = !gWire;
     if (k == GLFW_KEY_F2 && a == GLFW_PRESS) gCull = !gCull;
-    if (k == GLFW_KEY_TAB && a == GLFW_PRESS) {
-        gCap = !gCap;
-        glfwSetInputMode(w, GLFW_CURSOR, gCap ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+    if (k == GLFW_KEY_TAB && a == GLFW_PRESS) { gCap = !gCap; glfwSetInputMode(w, GLFW_CURSOR, gCap ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL); }
+}
+static void cursorCB(GLFWwindow* w, double x, double y) {
+    if (!gCap) { gCam.first = true; return; }
+    if (gCam.first) { gCam.lx = x; gCam.ly = y; gCam.first = false; }
+    double dx = x - gCam.lx, dy = gCam.ly - y; gCam.lx = x; gCam.ly = y;
+    gCam.yaw += (float)dx * gCam.sens; gCam.pitch += (float)dy * gCam.sens; gCam.pitch = glm::clamp(gCam.pitch, -89.f, 89.f);
+}
+
+// --- shapes (coords) ---
+static std::vector<glm::vec2> makeCoastPoly(int N, float R, float) {
+    std::vector<glm::vec2> P; P.reserve(N);
+    for (int k = 0; k < N; k++) {
+        float a = (float)k / N * glm::two_pi<float>();
+        float r = R * (1.0f + 0.16f * std::sin(3 * a + 0.4f) + 0.10f * std::sin(5 * a + 1.3f) + 0.06f * std::sin(7 * a + 2.1f));
+        P.push_back({ r * std::cos(a), r * std::sin(a) });
+    } if (!isCCW(P)) std::reverse(P.begin(), P.end()); return P;
+}
+static std::vector<glm::vec2> makeCirclePoly(glm::vec2 c, float r, int N) {
+    std::vector<glm::vec2> P; P.reserve(N);
+    for (int k = 0; k < N; k++) { float a = (float)k / N * glm::two_pi<float>(); P.push_back(c + glm::vec2(r * std::cos(a), r * std::sin(a))); }
+    if (!isCCW(P)) std::reverse(P.begin(), P.end()); return P;
+}
+
+// 顶面
+static void addTopFromPoly(Mesh& m, const std::vector<glm::vec2>& P, float y, float noiseAmp, float seed, float kind) {
+    size_t baseV = m.v.size();
+    for (auto& q : P) {
+        glm::vec3 pos(q.x, y, q.y); pos.y += noiseAmp * (fbm1(0.05f * pos.x + 0.04f * pos.z + seed) - 0.5f);
+        m.v.push_back(Vtx{ pos,glm::vec3(0),kind,0 });
+    }
+    std::vector<uint32_t> tris; earClipTriangulate(P, tris);
+    size_t baseI = m.i.size();
+    for (size_t t = 0; t < tris.size(); t += 3)
+        addTriI(m, (uint32_t)baseV + tris[t + 2], (uint32_t)baseV + tris[t + 1], (uint32_t)baseV + tris[t + 0]); // 反序→朝上
+    accumulateAndNormalizeTopNormals(m, baseV, baseI);
+}
+
+// 侧壁（外侧为正面）
+static void addCliffFromPoly(Mesh& m, const std::vector<glm::vec2>& P, float yTop, float yBot) {
+    size_t n = P.size();
+    for (size_t i = 0; i < n; i++) {
+        glm::vec2 a2 = P[i], b2 = P[(i + 1) % n];
+        glm::vec3 A(a2.x, yTop, a2.y), B(b2.x, yTop, b2.y), C(a2.x, yBot, a2.y), D(b2.x, yBot, b2.y);
+        uint32_t ia = (uint32_t)m.v.size(); m.v.push_back(Vtx{ A,glm::vec3(0),4,0 });
+        uint32_t ib = (uint32_t)m.v.size(); m.v.push_back(Vtx{ B,glm::vec3(0),4,0 });
+        uint32_t ic = (uint32_t)m.v.size(); m.v.push_back(Vtx{ C,glm::vec3(0),4,0 });
+        uint32_t id = (uint32_t)m.v.size(); m.v.push_back(Vtx{ D,glm::vec3(0),4,0 });
+        addTriI(m, ia, ib, ic);
+        addTriI(m, ib, id, ic);
+        glm::vec2 e = b2 - a2; glm::vec2 nor2 = glm::normalize(glm::vec2(-e.y, e.x)); glm::vec3 N(nor2.x, 0, nor2.y);
+        m.v[ia].nrm = m.v[ic].nrm = m.v[ib].nrm = m.v[id].nrm = N;
     }
 }
-// 鼠标视角
-static void cursorCB(GLFWwindow* w, double x, double y) {
-    Cam* c = (Cam*)glfwGetWindowUserPointer(w);
-    if (!gCap) { c->first = true; return; }
-    if (c->first) { c->lx = x; c->ly = y; c->first = false; }
-    double dx = x - c->lx, dy = c->ly - y; c->lx = x; c->ly = y;
-    c->yaw += (float)dx * c->sens; c->pitch += (float)dy * c->sens;
-    c->pitch = glm::clamp(c->pitch, -89.f, 89.f);
+
+// （可留可删）海岸白带几何——保留不影响 SDF 白带
+static void addRimFromCoast(Mesh& m, const std::vector<glm::vec2>& coast, float y, float d) {
+    auto inner = coast, outer = offsetMiter(coast, d, 4.0f); size_t n = inner.size();
+    std::vector<uint32_t> inID(n), outID(n); glm::vec3 N(0, 1, 0);
+    for (size_t i = 0; i < n; i++) {
+        inID[i] = (uint32_t)m.v.size(); m.v.push_back(Vtx{ {inner[i].x,y,inner[i].y}, N,3,0 });
+        outID[i] = (uint32_t)m.v.size(); m.v.push_back(Vtx{ {outer[i].x,y,outer[i].y}, N,3,0 });
+    }
+    for (size_t i = 0; i < n; i++) {
+        size_t j = (i + 1) % n;
+        addTriI(m, inID[i], inID[j], outID[i]);  // 自上看大多为 CCW
+        addTriI(m, inID[j], outID[j], outID[i]);
+    }
+}
+
+// 水面——CCW 朝上
+static void addWater(Mesh& m, float seaY) {
+    float W = 100.f; glm::vec3 nW(0, 1, 0);
+    uint32_t i0 = (uint32_t)m.v.size(); m.v.push_back(Vtx{ {-W,seaY - 0.04f,-W},nW,2,0 });
+    uint32_t i1 = (uint32_t)m.v.size(); m.v.push_back(Vtx{ { W,seaY - 0.04f,-W},nW,2,0 });
+    uint32_t i2 = (uint32_t)m.v.size(); m.v.push_back(Vtx{ {-W,seaY - 0.04f, W},nW,2,0 });
+    uint32_t i3 = (uint32_t)m.v.size(); m.v.push_back(Vtx{ { W,seaY - 0.04f, W},nW,2,0 });
+    addTriI(m, i0, i2, i1);
+    addTriI(m, i1, i2, i3);
+}
+
+// 构建场景
+static Mesh buildSceneByPolys(const std::vector<glm::vec2>& coast, const std::vector<std::vector<glm::vec2>>& plateaus, float seaY, float landY, float seed) {
+    Mesh m;
+    // 地面
+    {
+        size_t bV = m.v.size();
+        for (auto& q : coast) {
+            glm::vec3 pos(q.x, landY, q.y); pos.y += 0.02f * (fbm1(0.05f * pos.x + 0.04f * pos.z + seed) - 0.5f);
+            m.v.push_back(Vtx{ pos,glm::vec3(0),0,0 });
+        }
+        std::vector<uint32_t> tris; earClipTriangulate(coast, tris);
+        size_t bI = m.i.size();
+        for (size_t t = 0; t < tris.size(); t += 3) addTriI(m, (uint32_t)bV + tris[t + 2], (uint32_t)bV + tris[t + 1], (uint32_t)bV + tris[t + 0]);
+        accumulateAndNormalizeTopNormals(m, bV, bI);
+    }
+    // 高原
+    for (size_t k = 0; k < plateaus.size(); ++k) {
+        float yTop = landY + (k == 0 ? 0.70f : k == 1 ? 0.58f : 0.48f);
+        size_t bV = m.v.size();
+        for (auto& q : plateaus[k]) { glm::vec3 pos(q.x, yTop, q.y); m.v.push_back(Vtx{ pos,glm::vec3(0),1,0 }); }
+        std::vector<uint32_t> tris; earClipTriangulate(plateaus[k], tris);
+        size_t bI = m.i.size();
+        for (size_t t = 0; t < tris.size(); t += 3) addTriI(m, (uint32_t)bV + tris[t + 2], (uint32_t)bV + tris[t + 1], (uint32_t)bV + tris[t + 0]);
+        accumulateAndNormalizeTopNormals(m, bV, bI);
+        addCliffFromPoly(m, plateaus[k], yTop, landY);
+    }
+    // （可选）几何白带 + 水面
+    addRimFromCoast(m, coast, landY + 0.06f, 0.12f);
+    addWater(m, seaY);
+
+    m.upload(); return m;
 }
 
 int main() {
-    // —— 初始化窗口/上下文/GL函数 ——
     Check(glfwInit() != 0, "glfwInit");
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3); glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3); glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 #if _DEBUG
     glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, GL_TRUE);
 #endif
-    GLFWwindow* win = glfwCreateWindow(1280, 720,
-        "Island + Plateaus + Near-Shore Foam — CCW (SDF-curved foam)", nullptr, nullptr);
-    Check(win != nullptr, "create window");
-    glfwMakeContextCurrent(win); glfwSwapInterval(1);                // VSYNC=1
-    Check(gladLoadGLLoader((GLADloadproc)glfwGetProcAddress) != 0, "glad");
-    EnableGLDebugIfAvailable();
+    GLFWwindow* win = glfwCreateWindow(1280, 720, "Island (Polygon) + Plateaus + Foam SDF — SDF rim", nullptr, nullptr);
+    Check(win != nullptr, "create window"); glfwMakeContextCurrent(win); glfwSwapInterval(1);
+    Check(gladLoadGLLoader((GLADloadproc)glfwGetProcAddress) != 0, "glad"); EnableGLDebugIfAvailable();
 
-    // ———— 输入绑定 ————
+    glfwSetWindowUserPointer(win, &gCam);
     glfwSetKeyCallback(win, keyCB);
-    Cam cam; glfwSetWindowUserPointer(win, &cam);
     glfwSetCursorPosCallback(win, cursorCB);
     glfwSetInputMode(win, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
-    // —— 基准高度：海平面 & 陆地 —— 
-    const float seaY = 0.0f;
-    const float landY = seaY + 0.10f;
-
-    // —— 海岸形状参数（与 FS 同步） ——
+    const float seaY = 0.0f, landY = seaY + 0.10f;
     const float worldR = 6.5f;
-    const float rx = worldR * 1.35f, rz = worldR * 1.00f, nExp = 3.4f;
-    const glm::vec2 bays[3] = {
-        { glm::radians(-70.0f), 0.30f },
-        { glm::radians(20.0f),  0.25f },
-        { glm::radians(150.0f), 0.28f }
+
+    std::vector<glm::vec2> coast = makeCoastPoly(180, worldR, 1337.0f);
+    std::vector<std::vector<glm::vec2>> plateaus{
+        makeCirclePoly({-2.0f, 0.8f}, 2.2f, 96),
+        makeCirclePoly({ 2.6f,-1.5f}, 1.7f, 84),
+        makeCirclePoly({ 0.2f, 0.2f}, 1.2f, 72),
     };
-    const int bayCount = 3;
-    const float bayDepth = 0.22f;
-    const float rough = 0.10f;
-    const float seed = 1337.0f;
+    Mesh scene = buildSceneByPolys(coast, plateaus, seaY, landY, 1337.0f);
 
-    // —— 生成场景网格 —— 
-    Mesh island = buildFlatIsland(worldR, 260, seaY, landY, seed);
-
-    // —— 着色器 & uniform 位置 —— 
     GLuint prog = mkProgram(VS, FS);
-    GLint uMVP = glGetUniformLocation(prog, "uMVP");
-    GLint uModel = glGetUniformLocation(prog, "uModel");
-    GLint uNrm = glGetUniformLocation(prog, "uNrmMat");
-    GLint uCam = glGetUniformLocation(prog, "uCam");
-    GLint uLight = glGetUniformLocation(prog, "uLightDir");
-    GLint uHor = glGetUniformLocation(prog, "uHorizon");
-    GLint uSky = glGetUniformLocation(prog, "uSky");
-    GLint uNear = glGetUniformLocation(prog, "uFogNear");
-    GLint uFar = glGetUniformLocation(prog, "uFogFar");
-
-    // 近岸浪花相关 uniform
+    GLint uMVP = glGetUniformLocation(prog, "uMVP"), uModel = glGetUniformLocation(prog, "uModel"), uNrm = glGetUniformLocation(prog, "uNrmMat");
+    GLint uCam = glGetUniformLocation(prog, "uCam"), uLight = glGetUniformLocation(prog, "uLightDir");
+    GLint uHor = glGetUniformLocation(prog, "uHorizon"), uSky = glGetUniformLocation(prog, "uSky");
+    GLint uNear = glGetUniformLocation(prog, "uFogNear"), uFar = glGetUniformLocation(prog, "uFogFar");
     GLint uTime = glGetUniformLocation(prog, "uTime");
-    GLint uRxLoc = glGetUniformLocation(prog, "uRx");
-    GLint uRzLoc = glGetUniformLocation(prog, "uRz");
-    GLint uNExpLoc = glGetUniformLocation(prog, "uNExp");
-    GLint uBayCnt = glGetUniformLocation(prog, "uBayCount");
-    GLint uBaysLoc = glGetUniformLocation(prog, "uBays");
-    GLint uBayDep = glGetUniformLocation(prog, "uBayDepth");
-    GLint uRoughL = glGetUniformLocation(prog, "uRough");
-    GLint uSeedL = glGetUniformLocation(prog, "uSeed");
-    GLint uFWidth = glGetUniformLocation(prog, "uFoamWidth");
-    GLint uFFreq = glGetUniformLocation(prog, "uFoamFreq");
-    GLint uWSpeed = glGetUniformLocation(prog, "uWaveSpeed");
-    GLint uFDuty = glGetUniformLocation(prog, "uFoamDuty");
+    GLint uCoastCount = glGetUniformLocation(prog, "uCoastCount"), uCoastLoc = glGetUniformLocation(prog, "uCoast");
+    GLint uFWidth = glGetUniformLocation(prog, "uFoamWidth"), uFFreq = glGetUniformLocation(prog, "uFoamFreq");
+    GLint uWSpeed = glGetUniformLocation(prog, "uWaveSpeed"), uFDuty = glGetUniformLocation(prog, "uFoamDuty");
+    GLint uRimW = glGetUniformLocation(prog, "uLandRimWidth"); // 新增
 
-    // —— 全局渲染状态 —— 
     glEnable(GL_DEPTH_TEST);
-    glFrontFace(GL_CCW);        // 和构网一致：逆时针为正面
+    glFrontFace(GL_CCW);
+    glEnable(GL_CULL_FACE); glCullFace(GL_BACK);
+
+    Check((int)coast.size() <= 512, "coast size > 512");
+    glUseProgram(prog);
+    glUniform1i(uCoastCount, (GLint)coast.size());
+    glUniform2fv(uCoastLoc, (GLsizei)coast.size(), (const float*)coast.data());
 
     auto t0 = std::chrono::high_resolution_clock::now();
-    double last = glfwGetTime();
-
     while (!glfwWindowShouldClose(win)) {
-        // ———— 输入 & 时间 ————
         glfwPollEvents();
-        double now = glfwGetTime(); float dt = (float)(now - last); last = now;
 
-        // 背面剔除开关（F2）
-        if (gCull) { glEnable(GL_CULL_FACE); glCullFace(GL_BACK); }
-        else glDisable(GL_CULL_FACE);
+        glm::vec3 f = gCam.fwd(), r = gCam.right(), up(0, 1, 0);
+        float spd = gCam.speed * (gKeys[GLFW_KEY_LEFT_SHIFT] ? 2.f : 1.f);
+        if (gKeys[GLFW_KEY_W]) gCam.pos += f * spd * 0.016f;
+        if (gKeys[GLFW_KEY_S]) gCam.pos -= f * spd * 0.016f;
+        if (gKeys[GLFW_KEY_A]) gCam.pos -= r * spd * 0.016f;
+        if (gKeys[GLFW_KEY_D]) gCam.pos += r * spd * 0.016f;
+        if (gKeys[GLFW_KEY_SPACE]) gCam.pos += up * spd * 0.016f;
+        if (gKeys[GLFW_KEY_LEFT_CONTROL]) gCam.pos -= up * spd * 0.016f;
 
-        // 相机 WASD + 上下
-        glm::vec3 f = cam.fwd(), r = cam.right(), up(0, 1, 0);
-        float spd = cam.speed * (gKeys[GLFW_KEY_LEFT_SHIFT] ? 2.f : 1.f);
-        if (gKeys[GLFW_KEY_W]) cam.pos += f * spd * dt;
-        if (gKeys[GLFW_KEY_S]) cam.pos -= f * spd * dt;
-        if (gKeys[GLFW_KEY_A]) cam.pos -= r * spd * dt;
-        if (gKeys[GLFW_KEY_D]) cam.pos += r * spd * dt;
-        if (gKeys[GLFW_KEY_SPACE]) cam.pos += up * spd * dt;
-        if (gKeys[GLFW_KEY_LEFT_CONTROL]) cam.pos -= up * spd * dt;
-
-        // 光源缓慢转动
         float tt = std::chrono::duration<float>(std::chrono::high_resolution_clock::now() - t0).count();
         glm::vec3 lightDir = glm::normalize(glm::vec3(std::cos(tt * 0.1f) * 0.4f, -1.0f, std::sin(tt * 0.1f) * 0.4f));
 
-        // 视口 & 清屏 & 线框（F1）
         int W, H; glfwGetFramebufferSize(win, &W, &H);
         glViewport(0, 0, W, H);
         glClearColor(0.80f, 0.86f, 0.92f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
         glPolygonMode(GL_FRONT_AND_BACK, gWire ? GL_LINE : GL_FILL);
+        if (gCull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
 
-        // 矩阵
         float aspect = H > 0 ? (float)W / H : 16.f / 9.f;
-        glm::mat4 P = glm::perspective(glm::radians(cam.fov), aspect, 0.10f, 200.f);
-        glm::mat4 V = cam.view();
-        glm::mat4 M(1.f);
-        glm::mat4 MVP = P * V * M;
-        glm::mat3 N = glm::mat3(glm::transpose(glm::inverse(M)));
+        glm::mat4 P = glm::perspective(glm::radians(gCam.fov), aspect, 0.10f, 200.f);
+        glm::mat4 V = gCam.view(), M(1.f), MVP = P * V * M; glm::mat3 N = glm::mat3(glm::transpose(glm::inverse(M)));
 
-        // 绑定 shader & uniform
         glUseProgram(prog);
         glUniformMatrix4fv(uMVP, 1, GL_FALSE, glm::value_ptr(MVP));
         glUniformMatrix4fv(uModel, 1, GL_FALSE, glm::value_ptr(M));
         glUniformMatrix3fv(uNrm, 1, GL_FALSE, glm::value_ptr(N));
-        glUniform3fv(uCam, 1, glm::value_ptr(cam.pos));
+        glUniform3fv(uCam, 1, glm::value_ptr(gCam.pos));
         glUniform3fv(uLight, 1, glm::value_ptr(lightDir));
-        glUniform3f(uHor, 0.76f, 0.84f, 0.90f);
-        glUniform3f(uSky, 0.80f, 0.86f, 0.92f);
-        glUniform1f(uNear, 7.0f);
-        glUniform1f(uFar, 40.0f);
+        glUniform3f(uHor, 0.76f, 0.84f, 0.90f); glUniform3f(uSky, 0.80f, 0.86f, 0.92f);
+        glUniform1f(uNear, 7.0f); glUniform1f(uFar, 40.0f); glUniform1f(uTime, tt);
 
-        // —— 将海岸参数同步给 FS，保证 coastSDF 一致 —— 
-        glUniform1f(uTime, tt);
-        glUniform1f(uRxLoc, rx);
-        glUniform1f(uRzLoc, rz);
-        glUniform1f(uNExpLoc, nExp);
-        glUniform1i(uBayCnt, bayCount);
-        glUniform2fv(uBaysLoc, bayCount, (const float*)bays);
-        glUniform1f(uBayDep, bayDepth);
-        glUniform1f(uRoughL, rough);
-        glUniform1f(uSeedL, seed);
+        // 参数
+        glUniform1f(uFWidth, 0.38f);
+        glUniform1f(uFFreq, 2.0f);
+        glUniform1f(uWSpeed, +0.5f);
+        glUniform1f(uFDuty, 0.22f);
+        glUniform1f(uRimW, 0.22f); // 地面白带宽度（可调）
 
-        // —— 近岸泡沫参数（可按需调节）——
-        glUniform1f(uFWidth, 0.38f);  // 泡沫条纹离岸最大距离（米）
-        glUniform1f(uFFreq, 2.0f);    // 每米 2 条（法向）
-        glUniform1f(uWSpeed, -0.5f);  // 速度：FS 约定 >0 往岸，这里设 -0.5f（往外），可改为 +0.5f 往岸
-        glUniform1f(uFDuty, 0.22f);   // 白条占空比（宽度）
-        glUniform1f(uBayDep, 0.22f);  // 再同步一次，便于快速试参
-
-        // 绘制
-        glBindVertexArray(island.vao);
-        glDrawElements(GL_TRIANGLES, (GLsizei)island.i.size(), GL_UNSIGNED_INT, 0);
+        glBindVertexArray(scene.vao);
+        glDrawElements(GL_TRIANGLES, (GLsizei)scene.i.size(), GL_UNSIGNED_INT, 0);
         glBindVertexArray(0);
 
         glfwSwapBuffers(win);
     }
-
-    // —— 资源回收 ——
-    island.destroy();
-    glDeleteProgram(prog);
-    glfwTerminate();
-    return 0;
+    scene.destroy(); glDeleteProgram(prog); glfwTerminate(); return 0;
 }
