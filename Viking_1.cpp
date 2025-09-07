@@ -1,17 +1,19 @@
-﻿// main.cpp — Flat "Bad North"-style map (no cliffs), CCW winding fixed
+﻿// main.cpp — Island + Plateaus with White Cliffs (CCW, cliff facing fixed)
 // Deps (vcpkg): glfw3 glad glm
 // Build (MSVC x64):
 //   vcpkg install glfw3 glad glm
 //   cl /EHsc /std:c++20 /W4 main.cpp ^
 //      /I"%VCPKG_ROOT%\\installed\\x64-windows\\include" ^
 //      /D_CRT_SECURE_NO_WARNINGS /MD ^
-//      /Fe:island_flat.exe ^
+//      /Fe:island_plateau_realcliff.exe ^
 //      /link /LIBPATH:"%VCPKG_ROOT%\\installed\\x64-windows\\lib" glfw3.lib glad.lib opengl32.lib
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <vector>
+#include <string>
+#include <algorithm>
 #include <cmath>
 #include <chrono>
 
@@ -57,7 +59,7 @@ static float fbm1(float t, int oct = 4, float lac = 2.f, float gain = 0.5f) {
 }
 
 // ---------- Mesh ----------
-struct Vtx { glm::vec3 pos; glm::vec3 nrm; float kind; float band; }; // kind: 0=land, 2=water, 3=rim
+struct Vtx { glm::vec3 pos; glm::vec3 nrm; float kind; float band; }; // kind: 0=land, 2=water, 3=rim, 4=cliff
 struct Mesh {
     std::vector<Vtx> v; std::vector<uint32_t> i; GLuint vao = 0, vbo = 0, ebo = 0;
     void upload() {
@@ -77,6 +79,9 @@ struct Mesh {
     }
     void destroy() { if (ebo)glDeleteBuffers(1, &ebo); if (vbo)glDeleteBuffers(1, &vbo); if (vao)glDeleteVertexArrays(1, &vao); vao = vbo = ebo = 0; }
 };
+static inline uint32_t addV(Mesh& m, const Vtx& v) { m.v.push_back(v); return (uint32_t)m.v.size() - 1; }
+static inline void addTriI(Mesh& m, uint32_t a, uint32_t b, uint32_t c) { m.i.push_back(a); m.i.push_back(b); m.i.push_back(c); }
+
 static void addTri(Mesh& m, const Vtx& a, const Vtx& b, const Vtx& c) {
     uint32_t s = (uint32_t)m.v.size(); m.v.push_back(a); m.v.push_back(b); m.v.push_back(c);
     m.i.push_back(s); m.i.push_back(s + 1); m.i.push_back(s + 2);
@@ -84,8 +89,8 @@ static void addTri(Mesh& m, const Vtx& a, const Vtx& b, const Vtx& c) {
 
 // ---------- Shape helpers ----------
 static float superellipseRadius(float angle, float rx, float rz, float n) {
-    float ca = fabs(cos(angle)), sa = fabs(sin(angle));
-    float k = pow(pow(ca, n) / pow(rx, n) + pow(sa, n) / pow(rz, n), 1.0f / n);
+    float ca = std::fabs(std::cos(angle)), sa = std::fabs(std::sin(angle));
+    float k = std::pow(std::pow(ca, n) / std::pow(rx, n) + std::pow(sa, n) / std::pow(rz, n), 1.0f / n);
     return 1.0f / std::max(k, 1e-6f);
 }
 static float baseRadius(float a, float rx, float rz, float n,
@@ -94,16 +99,55 @@ static float baseRadius(float a, float rx, float rz, float n,
 {
     float R = superellipseRadius(a, rx, rz, n);
     for (auto b : bays) {
-        float da = atan2(sin(a - b.x), cos(a - b.x));
-        float dent = exp(-(da * da) / (2.0f * b.y * b.y));
+        float da = std::atan2(std::sin(a - b.x), std::cos(a - b.x));
+        float dent = std::exp(-(da * da) / (2.0f * b.y * b.y));
         R *= (1.0f - bayDepth * dent);
     }
-    float n1 = fbm1(seed + 1.5f * cos(a) + 0.8f * sin(a), 4, 2.0f, 0.55f);
+    float n1 = fbm1(seed + 1.5f * std::cos(a) + 0.8f * std::sin(a), 4, 2.0f, 0.55f);
     R *= (1.0f + rough * (n1 - 0.5f));
     return R;
 }
 
-// ---------- Build flat island (no cliffs) ----------
+struct Plateau { glm::vec2 c; float r0; float r1; float h; }; // r0 top radius; r1 unused guard
+
+// ------- plateau: cap + vertical cliff ring -------
+static void addPlateauCap(Mesh& m, const Plateau& s, float yTop, int seg = 160) {
+    const float inset = 0.02f * s.r0;
+    std::vector<uint32_t> ring(seg);
+    glm::vec3 N(0, 1, 0);
+    for (int k = 0; k < seg; ++k) {
+        float a = (float)k / seg * glm::two_pi<float>();
+        glm::vec2 dir(std::cos(a), std::sin(a));
+        glm::vec3 p(s.c.x + dir.x * (s.r0 - inset), yTop, s.c.y + dir.y * (s.r0 - inset));
+        ring[k] = addV(m, Vtx{ p, N, 0.f, 0.f });
+    }
+    glm::vec3 C(s.c.x, yTop, s.c.y);
+    uint32_t ic = addV(m, Vtx{ C, N, 0.f, 0.f });
+    for (int k = 0; k < seg; ++k) {
+        int k1 = (k + 1) % seg;
+        addTriI(m, ic, ring[k1], ring[k]); // CCW
+    }
+}
+static void addPlateauCliff(Mesh& m, const Plateau& s, float yTop, float yBottom, int seg = 160) {
+    std::vector<uint32_t> top(seg), bot(seg);
+    for (int k = 0; k < seg; ++k) {
+        float a = (float)k / seg * glm::two_pi<float>();
+        glm::vec2 dir(std::cos(a), std::sin(a));
+        glm::vec3 nrm(dir.x, 0, dir.y); // outward
+        glm::vec3 pt(s.c.x + dir.x * s.r0, yTop, s.c.y + dir.y * s.r0);
+        glm::vec3 pb(s.c.x + dir.x * s.r0, yBottom, s.c.y + dir.y * s.r0);
+        top[k] = addV(m, Vtx{ pt, nrm, 4.f, 0.f });
+        bot[k] = addV(m, Vtx{ pb, nrm, 4.f, 0.f });
+    }
+    for (int k = 0; k < seg; ++k) {
+        int k1 = (k + 1) % seg;
+        // >>> FIX: 使从外侧看为 CCW（原来顺序反了，导致面向相机被剔除）
+        addTriI(m, top[k], top[k1], bot[k]);   // CCW
+        addTriI(m, top[k1], bot[k1], bot[k]);   // CCW
+    }
+}
+
+// ---------- Build island + real plateaus ----------
 static Mesh buildFlatIsland(float worldR, int seg, float seaY, float landY, float seed) {
     float rx = worldR * 1.35f, rz = worldR * 1.00f, n = 3.4f;
     std::vector<glm::vec2> bays = {
@@ -111,51 +155,97 @@ static Mesh buildFlatIsland(float worldR, int seg, float seaY, float landY, floa
         { glm::radians(20.0f), 0.25f },
         { glm::radians(150.0f), 0.28f }
     };
-    float bayDepth = 0.22f, rough = 0.14f;
+    float bayDepth = 0.22f, rough = 0.10f;
 
-    // sample ring
-    std::vector<glm::vec3> ring(seg);
+    std::vector<float> Rb(seg);
     for (int k = 0; k < seg; k++) {
         float a = (float)k / seg * glm::two_pi<float>();
-        float R = baseRadius(a, rx, rz, n, bays, bayDepth, rough, seed);
-        ring[k] = { cos(a) * R, landY, sin(a) * R };
+        Rb[k] = baseRadius(a, rx, rz, n, bays, bayDepth, rough, seed);
     }
 
     Mesh m;
-    // top (fan) — CCW winding as seen from above
-    glm::vec3 nrm(0, 1, 0), c(0, landY, 0);
-    for (int k = 0; k < seg; k++) {
-        int k1 = (k + 1) % seg;
-        Vtx A{ c,nrm,0.f,0.f };
-        Vtx B{ ring[k], nrm, 0.f, 0.f };
-        Vtx C{ ring[k1],nrm, 0.f, 0.f };
-        addTri(m, A, C, B);   // <— flipped to CCW
+
+    // island base (flat-ish)
+    const int Nr = 28;
+    std::vector<std::vector<uint32_t>> vid(Nr + 1, std::vector<uint32_t>(seg));
+    size_t landVtxBegin = m.v.size();
+    size_t landIdxBegin = m.i.size();
+
+    for (int j = 0; j <= Nr; ++j) {
+        float t = (float)j / (float)Nr;
+        for (int k = 0; k < seg; ++k) {
+            float a = (float)k / seg * glm::two_pi<float>();
+            float R = Rb[k] * t;
+            glm::vec3 p{ std::cos(a) * R, landY, std::sin(a) * R };
+            float dy = 0.02f * worldR * (fbm1(0.05f * p.x + 0.04f * p.z + seed) - 0.5f);
+            p.y += dy;
+            vid[j][k] = addV(m, Vtx{ p, glm::vec3(0,1,0), 0.f, 0.f });
+        }
+    }
+    for (int j = 0; j < Nr; ++j) {
+        for (int k = 0; k < seg; ++k) {
+            int k1 = (k + 1) % seg;
+            uint32_t v00 = vid[j][k], v01 = vid[j][k1];
+            uint32_t v10 = vid[j + 1][k], v11 = vid[j + 1][k1];
+            addTriI(m, v00, v11, v10); // CCW
+            addTriI(m, v00, v01, v11); // CCW
+        }
+    }
+    size_t landIdxEnd = m.i.size();
+    for (size_t idx = landIdxBegin; idx + 2 < landIdxEnd; idx += 3) {
+        uint32_t i0 = m.i[idx], i1 = m.i[idx + 1], i2 = m.i[idx + 2];
+        glm::vec3 p0 = m.v[i0].pos, p1 = m.v[i1].pos, p2 = m.v[i2].pos;
+        glm::vec3 nrm = glm::normalize(glm::cross(p1 - p0, p2 - p0));
+        m.v[i0].nrm += nrm; m.v[i1].nrm += nrm; m.v[i2].nrm += nrm;
+    }
+    for (size_t vi = landVtxBegin; vi < m.v.size(); ++vi) {
+        if (m.v[vi].kind == 0.f) {
+            glm::vec3 n = m.v[vi].nrm;
+            if (glm::dot(n, n) < 1e-8f) n = glm::vec3(0, 1, 0);
+            m.v[vi].nrm = glm::normalize(n);
+        }
     }
 
-    // shoreline rim (thin white ribbon) — CCW
+    // plateaus
+    Plateau pts[] = {
+        { { -0.28f * rx,  0.08f * rz }, 0.55f * worldR, 0.90f * worldR, 0.80f },
+        { {  0.46f * rx, -0.22f * rz }, 0.42f * worldR, 0.80f * worldR, 0.55f },
+        { {  0.06f * rx,  0.05f * rz }, 0.32f * worldR, 0.70f * worldR, 0.45f },
+    };
+    for (auto& s : pts) {
+        float yTop = landY + s.h;
+        float yBot = landY;
+        addPlateauCap(m, s, yTop, 200);
+        addPlateauCliff(m, s, yTop, yBot, 200); // CCW fixed
+    }
+
+    // shoreline rim
     float rimLift = 0.06f, rimWidth = 0.45f;
     for (int k = 0; k < seg; k++) {
         int k1 = (k + 1) % seg;
-        glm::vec2 p0(ring[k].x, ring[k].z), p1(ring[k1].x, ring[k1].z);
-        glm::vec2 t = glm::normalize(p1 - p0);
-        glm::vec2 n2(-t.y, t.x);
+        float a0 = (float)k / seg * glm::two_pi<float>();
+        float a1 = (float)k1 / seg * glm::two_pi<float>();
+        glm::vec2 p0(std::cos(a0) * Rb[k], std::sin(a0) * Rb[k]);
+        glm::vec2 p1(std::cos(a1) * Rb[k1], std::sin(a1) * Rb[k1]);
+        glm::vec2 t2 = glm::normalize(p1 - p0);
+        glm::vec2 n2(-t2.y, t2.x);
         glm::vec3 i0(p0.x, seaY + rimLift, p0.y);
         glm::vec3 i1(p1.x, seaY + rimLift, p1.y);
         glm::vec3 o0(p0.x + n2.x * rimWidth, seaY + rimLift, p0.y + n2.y * rimWidth);
         glm::vec3 o1(p1.x + n2.x * rimWidth, seaY + rimLift, p1.y + n2.y * rimWidth);
         glm::vec3 N = glm::normalize(glm::cross(i1 - i0, o0 - i0));
         Vtx A{ i0,N,3.f,0 }, B{ i1,N,3.f,0 }, C{ o0,N,3.f,0 }, D{ o1,N,3.f,0 };
-        addTri(m, A, C, B);   // flip
-        addTri(m, B, C, D);   // flip
+        addTri(m, A, C, B);
+        addTri(m, B, C, D);
     }
 
-    // water plane (slightly below sea) — CCW
+    // water plane
     {
-        float W = worldR * 6.f, wy = seaY - 0.04f; glm::vec3 n(0, 1, 0);
+        float W = worldR * 6.f, wy = seaY - 0.04f; glm::vec3 nW(0, 1, 0);
         glm::vec3 p0{ -W,wy,-W }, p1{ W,wy,-W }, p2{ -W,wy,W }, p3{ W,wy,W };
-        Vtx A{ p0,n,2.f,0 }, B{ p1,n,2.f,0 }, C{ p2,n,2.f,0 }, D{ p3,n,2.f,0 };
-        addTri(m, A, C, B);   // flip
-        addTri(m, B, C, D);   // flip
+        Vtx A{ p0,nW,2.f,0 }, B{ p1,nW,2.f,0 }, C{ p2,nW,2.f,0 }, D{ p3,nW,2.f,0 };
+        addTri(m, A, C, B);
+        addTri(m, B, C, D);
     }
 
     m.upload();
@@ -189,9 +279,11 @@ out vec4 FragColor;
 vec3 landColor(){ return vec3(0.80,0.82,0.66); }
 vec3 waterColor(){ return vec3(0.50,0.68,0.84); }
 vec3 rimColor()  { return vec3(0.97,0.97,0.99); }
+vec3 cliffColor(){ return vec3(0.97,0.97,0.99); }
 
 void main(){
-    vec3 base = (vKind>2.5)? rimColor() :
+    vec3 base = (vKind>3.5)? cliffColor() :
+                (vKind>2.5)? rimColor()   :
                 (vKind>1.5)? waterColor() :
                               landColor();
 
@@ -206,7 +298,6 @@ void main(){
     float f = clamp((d - uFogNear)/(uFogFar - uFogNear), 0.0, 1.0);
     vec3 fogCol = mix(uHorizon, uSky, 0.3);
     col = mix(col, fogCol, f);
-
     FragColor = vec4(col,1.0);
 }
 )GLSL";
@@ -225,15 +316,16 @@ static GLuint mkProgram(const char* vs, const char* fs) {
 struct Cam {
     glm::vec3 pos{ 0,3.0f,9.0f }; float yaw = -90.f, pitch = -15.f, fov = 60.f, speed = 6.f, sens = 0.1f;
     bool first = true; double lx = 0, ly = 0;
-    glm::vec3 fwd()const { float cy = cos(glm::radians(yaw)), sy = sin(glm::radians(yaw)), cp = cos(glm::radians(pitch)), sp = sin(glm::radians(pitch)); return glm::normalize(glm::vec3(cy * cp, sp, sy * cp)); }
+    glm::vec3 fwd()const { float cy = std::cos(glm::radians(yaw)), sy = std::sin(glm::radians(yaw)), cp = std::cos(glm::radians(pitch)), sp = std::sin(glm::radians(pitch)); return glm::normalize(glm::vec3(cy * cp, sp, sy * cp)); }
     glm::vec3 right()const { return glm::normalize(glm::cross(fwd(), { 0,1,0 })); }
     glm::mat4 view()const { return glm::lookAt(pos, pos + fwd(), { 0,1,0 }); }
 };
-static bool gKeys[512]{}, gWire = false, gCap = true;
+static bool gKeys[512]{}, gWire = false, gCap = true, gCull = true;
 static void keyCB(GLFWwindow* w, int k, int, int a, int) {
     if (k >= 0 && k < 512) { if (a == GLFW_PRESS)gKeys[k] = true; else if (a == GLFW_RELEASE)gKeys[k] = false; }
     if (k == GLFW_KEY_ESCAPE && a == GLFW_PRESS) glfwSetWindowShouldClose(w, 1);
     if (k == GLFW_KEY_F1 && a == GLFW_PRESS) gWire = !gWire;
+    if (k == GLFW_KEY_F2 && a == GLFW_PRESS) gCull = !gCull; // toggle culling
     if (k == GLFW_KEY_TAB && a == GLFW_PRESS) { gCap = !gCap; glfwSetInputMode(w, GLFW_CURSOR, gCap ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL); }
 }
 static void cursorCB(GLFWwindow* w, double x, double y) {
@@ -253,7 +345,7 @@ int main() {
 #if _DEBUG
     glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, GL_TRUE);
 #endif
-    GLFWwindow* win = glfwCreateWindow(1280, 720, "Flat Island (no cliffs) — CCW", nullptr, nullptr);
+    GLFWwindow* win = glfwCreateWindow(1280, 720, "Island + Plateaus with White Cliffs — CCW (cliff fixed)", nullptr, nullptr);
     Check(win != nullptr, "create window");
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
@@ -286,9 +378,7 @@ int main() {
         uFar = glGetUniformLocation(prog, "uFogFar");
 
     glEnable(GL_DEPTH_TEST);
-    glEnable(GL_CULL_FACE);
-    glCullFace(GL_BACK);
-    glFrontFace(GL_CCW); // explicit
+    glFrontFace(GL_CCW);
 
     auto t0 = std::chrono::high_resolution_clock::now();
     double last = glfwGetTime();
@@ -296,6 +386,9 @@ int main() {
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
         double now = glfwGetTime(); float dt = (float)(now - last); last = now;
+
+        if (gCull) { glEnable(GL_CULL_FACE); glCullFace(GL_BACK); }
+        else { glDisable(GL_CULL_FACE); }
 
         glm::vec3 f = cam.fwd(), r = cam.right(), up(0, 1, 0);
         float spd = cam.speed * (gKeys[GLFW_KEY_LEFT_SHIFT] ? 2.f : 1.f);
@@ -307,7 +400,7 @@ int main() {
         if (gKeys[GLFW_KEY_LEFT_CONTROL]) cam.pos -= up * spd * dt;
 
         float tt = std::chrono::duration<float>(std::chrono::high_resolution_clock::now() - t0).count();
-        glm::vec3 lightDir = glm::normalize(glm::vec3(cos(tt * 0.1f) * 0.4f, -1.0f, sin(tt * 0.1f) * 0.4f));
+        glm::vec3 lightDir = glm::normalize(glm::vec3(std::cos(tt * 0.1f) * 0.4f, -1.0f, std::sin(tt * 0.1f) * 0.4f));
 
         int W, H; glfwGetFramebufferSize(win, &W, &H);
         glViewport(0, 0, W, H);
