@@ -408,8 +408,9 @@ void main(){
         float saw = fract(cycles);
         float foam = step(saw, clamp(uFoamDuty,0.0,1.0)) * nearMask;
 
-        // 轻微水面亮度起伏（使用 s 保持与岸平行）
-        float waterUndulate = 0.96 + 0.04*sin(s*0.8 - 0.7*uTime + 3.0*nJitter);
+        // 只在近岸 (s<=uFoamWidth) 才有轻微起伏，远处=1.0 不改颜色
+        float nearSoft = smoothstep(uFoamWidth, 0.0, s); // 近岸1，远处0
+        float waterUndulate = 1.0 + 0.04 * nearSoft * sin(s*0.8 - 0.7*uTime + 3.0*nJitter);
         col *= waterUndulate;
 
         // Mono 混合到白色泡沫
@@ -603,6 +604,7 @@ int main() {
         glUniform1f(uFFreq, 2.0f);     // 条/米（沿 SDF）
         glUniform1f(uWSpeed, -0.5f);    // >0 往岸移动
         glUniform1f(uFDuty, 0.22f);
+        glUniform1f(uBayDep, 0.22f);
 
         glBindVertexArray(island.vao);
         glDrawElements(GL_TRIANGLES, (GLsizei)island.i.size(), GL_UNSIGNED_INT, 0);
